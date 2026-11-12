@@ -1,0 +1,18 @@
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Secrets
+.env
+
+# Generated data and run state (regenerate with `jellybean generate-data`)
+data/
+ground_truth/
+workspace/
+.internals/
+

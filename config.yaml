@@ -1,0 +1,77 @@
+# Jellybean limits and thresholds. Every value has a default in
+# `src/jellybean/settings.py`; this file documents and overrides them.
+
+run:
+  default_seed: 42                 # seed used when `--seed` is not given
+
+limits:
+  max_iterations_per_agent: 25     # tool-use turns before an agent is stopped
+  token_budget_per_run: 4000000    # total LLM tokens per run (clean stop + partial report)
+  tool_timeout_s: 300              # default per-tool timeout
+  max_rework_cycles: 2             # critic-driven rework loops
+
+tool_output:
+  max_output_chars: 4000           # hard cap on a serialised ToolResult
+  max_raw_rows: 20                 # hard cap on raw data rows returned by any tool
+
+llm:                               # provider, model and key are set in .env
+  max_tokens: 4096                 # max output tokens per model call
+  temperature: null                # null = provider default
+  request_timeout_s: 180
+  max_retries: 3
+  prompt_caching: true             # cache the stable prompt prefix (anthropic, bedrock)
+
+join_confidence:                   # the system only auto-confirms a join if ALL hold
+  min_coverage: 0.95               # share of primary rows with a match
+  min_right_uniqueness: 0.999      # key uniqueness on the enrichment side
+  max_fanout: 1.01                 # rows after join / rows before
+  min_score_margin: 0.15           # score margin over the second-best candidate
+
+pattern_registry:
+  known_threshold: 0.85            # similarity >= this  -> known
+  variant_threshold: 0.60          # similarity >= this  -> variant, below -> new
+
+detection:
+  lof_max_rows: 50000              # quadratic methods (LOF) sample above this size
+  contamination: 0.01              # share of entities flagged by each outlier method
+  contextual_contamination: 0.03   # share flagged inside each context group (global outliers use slots too)
+  min_votes: 2                     # outlier methods that must agree before an entity is pooled
+  min_group_size: 3                # smallest group of entities that becomes a finding
+  group_distance: 0.5              # cosine distance used to group pooled outliers
+  max_cluster_share: 0.02          # clusters larger than this share of entities are "normal"
+  max_findings: 12                 # cap on candidate findings sent to the critic
+  findings_per_family: 3           # feature-family groups: the best of each family...
+  max_family_findings: 16          # ...with their own cap, on top of max_findings
+  merge_overlap: 0.8               # merge findings when this share of the smaller one overlaps
+  ts_threshold: 6.0                # robust z-score for time-series anomalies
+
+critic:
+  min_stability: 0.6               # a finding below this stability cannot be "confirmed"
+  stability_runs: 5                # repetitions with other seeds/subsamples
+  artifact_min_share: 0.5          # share of a finding explained by a source (file, nulls, cleaning op)
+  artifact_min_lift: 5.0           # ... and its lift over the population, to suspect an artifact
+
+masking:
+  apply_to_run_sql: true           # also mask PII columns in run_sql row previews
+  value_match_ratio: 0.5           # share of sampled values matching a PII pattern
+  column_name_patterns:            # case-insensitive regexes on column names
+    - "msisdn"
+    - "phone"
+    - "mobile"
+    - "imei"
+    - "imsi"
+    - "iccid"
+    - "e_?mail"
+    - "(^|_)(first_|last_|full_|customer_)?name$"
+    - "address"
+    - "iban"
+    - "passport"
+    - "(^|_)nif$"
+    - "(^|_)ssn$"
+    - "(^|_)ip(_address)?$"
+    - "destination_number"
+    - "customer_id"
+  value_patterns:                  # regexes on string values
+    - "^\\+?\\d{9,15}$"                      # phone-like numbers
+    - "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"       # e-mail addresses
+    - "^[A-Z]{2}\\d{2}[A-Z0-9]{10,30}$"      # IBAN-like strings
