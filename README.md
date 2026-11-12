@@ -1,4 +1,4 @@
-# Jellybean
+<h1><img src="docs/assets/jellybean.svg" alt="Jellybean logo" width="64" align="middle"> Jellybean</h1>
 
 Proof of concept of a **multi-agent team** that receives a natural-language
 instruction (e.g. *"analyzes the data in the traffic and enriches it with
