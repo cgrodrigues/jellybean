@@ -695,6 +695,8 @@ def check_temporal_coverage(dataset: str, time_column: str) -> ToolResult:
                 peers = [h for o, h in per_day.items() if o != d and (o.weekday() >= 5) == weekend]
             if len(peers) < 2:
                 peers = [h for o, h in per_day.items() if o != d]
+            if not peers:
+                continue  # a single day (or one date partition): nothing to compare it with
             # Per-hour median of the peers' normalised profiles: robust to one odd peer.
             normalised = [[v / (sum(h) or 1.0) for v in h] for h in peers]
             reference = [statistics.median(p[i] for p in normalised) for i in range(24)]

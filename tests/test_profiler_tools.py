@@ -6,6 +6,7 @@ Fixture recap: ``events.phone`` is ``+35191`` + 7 digits (50 distinct values) an
 
 from __future__ import annotations
 
+import pytest
 import yaml
 
 from jellybean.runtime.context import RunContext
@@ -191,3 +192,26 @@ def test_generated_data_has_a_timezone_aware_column(tmp_path) -> None:
     ).fetchall()[0][0]
     assert kind == "TIMESTAMP WITH TIME ZONE"
 
+
+def _single_day_dataset(settings, name: str, partitioned: bool) -> None:
+    import duckdb
+
+    folder = settings.data_root / name / ("date=2026-10-01" if partitioned else "")
+    folder.mkdir(parents=True)
+    con = duckdb.connect()
+    con.execute(
+        f"""COPY (SELECT range AS id, TIMESTAMP '2026-10-01 00:00:00' + INTERVAL (range * 2) MINUTE AS ts
+                  FROM range(700)) TO '{folder / "part-0.parquet"}' (FORMAT parquet)"""
+    )
+    con.close()
+
+
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_temporal_coverage_of_a_single_day(run_ctx: RunContext, settings, partitioned: bool) -> None:
+    """One day (or one date partition) has no other day to compare its hourly profile with."""
+    name = "one_day_part" if partitioned else "one_day"
+    _single_day_dataset(settings, name, partitioned)
+    result = pt.check_temporal_coverage(name, "ts")
+    assert result.status == "ok", result.summary
+    kinds = {i["kind"] for i in ArtifactStore().load_json(result.artifact_id)["issues"]}
+    assert not kinds & {"hour_profile_shift", "possible_timezone_shift"}
