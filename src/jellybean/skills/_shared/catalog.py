@@ -9,17 +9,24 @@ query ``SELECT ... FROM traffic`` and never handle file paths.
 sandboxed mode (the default) the connection can only touch files under the
 data root and the run workspace, extension auto-loading is disabled and the
 configuration is locked, so a query cannot widen its own permissions.
+
+Every connection has a memory limit, a thread limit and a spill directory inside
+the run folder (``limits`` in ``config.yaml``), so a heavy query slows down and
+uses disk instead of exhausting the machine. Connections are registered with the
+tool call that opened them, which interrupts them on timeout or Ctrl+C.
 """
 
 from __future__ import annotations
 
 import re
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import duckdb
 
+from jellybean.runtime.cancellation import track_connection
 from jellybean.runtime.context import RunContext, maybe_current_run
 from jellybean.settings import Settings, get_settings
 
@@ -117,12 +124,25 @@ def connect(
     settings = settings or (ctx.settings if ctx else get_settings())
     con = duckdb.connect(":memory:")
     try:
+        # A connection opened by a tool call is interrupted and closed if the call is cancelled.
+        track_connection(con)
         allowed = [str(settings.data_root) + "/"]
-        if ctx is not None:
-            allowed.append(str(ctx.run_dir) + "/")
+        # Spill directory: inside the run folder, or a private temporary folder outside a run.
+        tmp = ctx.tmp_dir if ctx is not None else Path(tempfile.gettempdir()) / "jellybean-duckdb"
+        tmp.mkdir(parents=True, exist_ok=True)
+        allowed.append((str(ctx.run_dir) if ctx is not None else str(tmp)) + "/")
         if sandboxed:
             dirs = ", ".join(f"'{sql_escape(d)}'" for d in allowed)
             con.execute(f"SET allowed_directories = [{dirs}]")
+        # Resource limits (config.yaml, `limits`): bounded memory and threads, spilling to disk.
+        limits = settings.config.limits
+        con.execute(f"SET temp_directory = '{sql_escape(str(tmp))}'")
+        if limits.duckdb_memory_limit:
+            con.execute(f"SET memory_limit = '{sql_escape(limits.duckdb_memory_limit)}'")
+        if limits.duckdb_threads:
+            con.execute(f"SET threads = {int(limits.duckdb_threads)}")
+        if limits.duckdb_max_temp_size:
+            con.execute(f"SET max_temp_directory_size = '{sql_escape(limits.duckdb_max_temp_size)}'")
 
         for info in discover_datasets(settings.data_root).values():
             where = dataset_filter(info.name, ctx)

@@ -6,7 +6,7 @@ individual tool can forget them:
 
 * parameters are validated with pydantic before the function runs;
 * exceptions become ``status="error"`` results (they never kill the agent);
-* a per-tool timeout is applied;
+* a per-tool timeout is applied, and the work is stopped when it is reached;
 * ``seed`` is injected from the active run when the caller omits it;
 * raw rows (``summary["rows"]``) are capped at ``max_raw_rows``;
 * the serialised result is capped at ``max_output_chars`` and marked
@@ -19,13 +19,13 @@ the ToolRegistry (phase 3) hands to the LLM.
 
 from __future__ import annotations
 
-import concurrent.futures
 import contextvars
 import copy
 import inspect
 import json
 import math
 import re
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -39,6 +39,7 @@ from typing import Any, Literal, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
+from jellybean.runtime.cancellation import CallScope, current_scope, set_scope
 from jellybean.runtime.context import maybe_current_run
 from jellybean.runtime.tracing import log_exception, trace_tool_call
 from jellybean.settings import get_settings
@@ -371,19 +372,76 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def _run_with_timeout(fn: Callable[..., Any], kwargs: dict[str, Any], timeout_s: float) -> Any:
+# After a timeout the worker gets this long to stop before the caller moves on; a
+# reaper thread keeps interrupting it afterwards.
+_STOP_GRACE_S = 2.0
+_REAP_INTERVAL_S = 0.02
+_REAP_MAX_S = 600.0
+
+
+def _reap(scope: CallScope, thread: threading.Thread, wait_s: float) -> bool:
+    """Interrupt the queries of a cancelled call until its thread ends, at most ``wait_s``.
+
+    A tool may catch the interruption of one query and start the next: interrupting
+    repeatedly stops those too. Returns whether the thread ended; its connections
+    are closed then.
+    """
+    deadline = time.monotonic() + wait_s
+    while thread.is_alive() and time.monotonic() < deadline:
+        scope.cancel()
+        thread.join(_REAP_INTERVAL_S)
+    if thread.is_alive():
+        return False
+    scope.close_connections()
+    scope.detach()
+    return True
+
+
+def _stop(scope: CallScope, thread: threading.Thread) -> None:
+    """Cancel a call: stop its queries now, and keep at it in the background if it lingers."""
+    scope.cancel()
+    # Wait briefly only when there is a query to interrupt: the caller then gets its
+    # error with the memory already freed. Pure-Python work gets no grace.
+    if not _reap(scope, thread, _STOP_GRACE_S if scope.has_queries() else 0.0):
+        # Pure-Python work cannot be interrupted: a daemon thread keeps trying, and
+        # neither thread keeps the process alive at exit.
+        threading.Thread(target=_reap, args=(scope, thread, _REAP_MAX_S), name="tool-reaper", daemon=True).start()
+
+
+def _run_with_timeout(fn: Callable[..., Any], kwargs: dict[str, Any], timeout_s: float, name: str = "tool") -> Any:
     """Run ``fn`` in a worker thread, raising ``TimeoutError`` after ``timeout_s``.
 
-    Python threads cannot be killed: on timeout the worker keeps running in the
-    background, but the agent gets an error result immediately.
+    Python threads cannot be killed, so on timeout (or Ctrl+C) the call is
+    cancelled instead: its DuckDB queries are interrupted, which ends the work of
+    nearly every tool at once and frees its memory, and its connections are closed
+    when the thread ends. The worker is a daemon thread: one that is stuck in
+    pure-Python work never blocks the exit of the process.
     """
+    scope = CallScope(parent=current_scope())
     ctx = contextvars.copy_context()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tool")
+    ctx.run(set_scope, scope)
+    box: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["value"] = ctx.run(fn, **kwargs)
+        except BaseException as exc:  # handed to the caller below
+            box["error"] = exc
+
+    thread = threading.Thread(target=work, name=f"tool-{name}", daemon=True)
+    thread.start()
     try:
-        future = executor.submit(ctx.run, fn, **kwargs)
-        return future.result(timeout=timeout_s)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        thread.join(timeout_s)
+    except BaseException:  # KeyboardInterrupt: stop the work before leaving
+        _stop(scope, thread)
+        raise
+    if thread.is_alive():
+        _stop(scope, thread)
+        raise TimeoutError
+    scope.detach()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def _error_message(result: ToolResult) -> str | None:
@@ -444,7 +502,7 @@ def tool(
                 # 3) Execute with a timeout, remembering the tool for lineage.
                 token = _current_tool.set(tool_name)
                 try:
-                    raw = _run_with_timeout(func, call_kwargs, limit_time)
+                    raw = _run_with_timeout(func, call_kwargs, limit_time, tool_name)
                 finally:
                     _current_tool.reset(token)
                 if isinstance(raw, ToolResult):
@@ -458,7 +516,10 @@ def tool(
             except ValidationError as exc:
                 result = ToolResult.error(_format_validation_error(exc))
             except TimeoutError:
-                result = ToolResult.error(f"Tool '{tool_name}' timed out after {limit_time:g}s")
+                result = ToolResult.error(
+                    f"Tool '{tool_name}' timed out after {limit_time:g}s and was stopped. "
+                    "Do not repeat the same call: narrow it (fewer columns, a filter, a sample)."
+                )
             except Exception as exc:
                 # Unexpected: the message goes to the agent, the trace and the console;
                 # the full traceback to logs/errors.log.

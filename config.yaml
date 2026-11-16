@@ -9,6 +9,9 @@ limits:
   token_budget_per_run: 4000000    # total LLM tokens per run (clean stop + partial report)
   tool_timeout_s: 300              # default per-tool timeout
   max_rework_cycles: 2             # critic-driven rework loops
+  duckdb_memory_limit: 4GB         # per DuckDB connection; above it queries spill to <run>/tmp (null = 80% of RAM)
+  duckdb_threads: 4                # threads per DuckDB connection (null = all cores)
+  duckdb_max_temp_size: 50GB       # cap on data spilled to disk (null = DuckDB default)
 
 tool_output:
   max_output_chars: 4000           # hard cap on a serialised ToolResult

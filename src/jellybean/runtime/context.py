@@ -72,6 +72,11 @@ class RunContext:
         return self.logs_dir / "trace.jsonl"
 
     @property
+    def tmp_dir(self) -> Path:
+        """Scratch space of the run (DuckDB spills here when a query exceeds its memory limit)."""
+        return self.run_dir / "tmp"
+
+    @property
     def errors_path(self) -> Path:
         return self.logs_dir / "errors.log"
 

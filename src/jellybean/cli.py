@@ -189,6 +189,29 @@ def _progress(quiet: bool, verbose: bool):
         remove_listener(listener)
 
 
+@contextmanager
+def _interruptible(ctx):
+    """Make Ctrl+C return the prompt at once.
+
+    The interruption has already stopped the running queries (see
+    ``tool_registry._run_with_timeout``). Agents in worker threads may still be
+    waiting for an LLM answer; the process exits without waiting for them, after
+    removing the run's scratch files. The run can be continued with ``resume``.
+    """
+    try:
+        yield
+    except KeyboardInterrupt:
+        import os
+        import shutil
+        import sys
+
+        shutil.rmtree(ctx.tmp_dir, ignore_errors=True)
+        typer.secho(f"\nInterrupted. Continue with: jellybean resume {ctx.run_id}", fg=typer.colors.YELLOW, err=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)
+
+
 def _finish(runtime, result) -> None:
     """Persist the orchestrator result, (re)write report.md and print the outcome."""
     from jellybean.reporting import write_report_file
@@ -322,7 +345,7 @@ def run(
     )
     runtime = _runtime(ctx, auto_approve, {"instruction": instruction, "labels": labels, "entity": user_entity})
     typer.echo(f"Run {ctx.run_id} ({settings.env.provider}:{runtime.llm.model_name}) -> {ctx.run_dir}")
-    with _progress(quiet, verbose):
+    with _progress(quiet, verbose), _interruptible(ctx):
         result = runtime.run_agent("orquestrador", instruction)
     _finish(runtime, result)
 
@@ -354,7 +377,7 @@ def resume(
         "that point, reuse existing artifacts and findings, and do not repeat completed steps."
     )
     typer.echo(f"Resuming {run_id} at phase '{spec.phase}' ({ctx.settings.env.provider}:{runtime.llm.model_name})")
-    with _progress(quiet, verbose):
+    with _progress(quiet, verbose), _interruptible(ctx):
         result = runtime.run_agent("orquestrador", task)
     _finish(runtime, result)
 
