@@ -274,17 +274,15 @@ def get_artifact_info(artifact_id: str) -> ToolResult:
     return ToolResult.ok(info, artifact_id=artifact_id)
 
 
-# JSON artifacts that agents may read in full. Others (e.g. join tests, which
-# list raw duplicated key values) stay summarised by the tools that made them.
 # JSON artifacts an agent may read in full: plans, issues, dictionaries and the
-# profiler's evidence (summaries with masked examples). Profiles with sample values
-# and table artifacts are not read this way.
+# profiler's evidence (summaries with masked examples). Join tests (they list raw
+# duplicated key values) and profiles (sample values) stay summarised by the tools
+# that made them; table artifacts are queried with run_sql.
 _READABLE_JSON_PREFIXES = (
     "cleaning_plan",
     "quality_issues",
     "feature_dictionary",
     "join_candidates",
-    "join_test",
     "grain",
     "entities",
     "temporal",
@@ -302,8 +300,8 @@ _READABLE_JSON_PREFIXES = (
 def read_json_artifact(artifact_id: str) -> ToolResult:
     """Read the content of a JSON artifact: a plan, quality issues, a feature dictionary or the profiler's evidence.
 
-    Readable: cleaning plans, quality issues, feature dictionaries, join candidates
-    and tests, grain, entities, temporal coverage and the integrity checks (nulls,
+    Readable: cleaning plans, quality issues, feature dictionaries, join candidates,
+    grain, entities, temporal coverage and the integrity checks (nulls,
     invariants, references, reciprocity, duplicate keys, signs, self-references).
 
     Large content is shortened to fit the output limit.
