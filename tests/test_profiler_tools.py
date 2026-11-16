@@ -154,3 +154,40 @@ def test_scale_shift_of_a_whole_partition_is_one_issue() -> None:
     out = pt._collapse_by_partition([*shifted, other], files)
     assert out[0]["file"] == "date=2026-10-17/" and out[0]["files"] == 24 and out[0]["rows"] == 240
     assert out[1]["file"] == "date=2026-10-18/hour=05/part-0.parquet"  # a single shifted file stays as is
+
+
+def test_timezone_aware_timestamps_are_profiled(run_ctx: RunContext, settings) -> None:
+    """TIMESTAMPTZ values reach Python through pytz (a declared dependency)."""
+    import duckdb
+
+    folder = settings.data_root / "tz_events"
+    folder.mkdir()
+    con = duckdb.connect()
+    con.execute(
+        f"""COPY (SELECT range AS id, (range % 7) * 2.5 AS amount,
+                         (TIMESTAMP '2026-10-01 00:00:00' + INTERVAL (range * 20) MINUTE) AT TIME ZONE 'UTC' AS ts
+                  FROM range(600)) TO '{folder / "part-0.parquet"}' (FORMAT parquet)"""
+    )
+    assert con.execute(f"SELECT typeof(ts) FROM '{folder / 'part-0.parquet'}' LIMIT 1").fetchone()[0] == (
+        "TIMESTAMP WITH TIME ZONE"
+    )
+    con.close()
+
+    profile = pt.profile_table("tz_events")
+    assert profile.status == "ok", profile.summary
+    assert {c["name"]: c for c in profile.summary["columns"]}["ts"]["type"] == "TIMESTAMP WITH TIME ZONE"
+    coverage = pt.check_temporal_coverage("tz_events", "ts")
+    assert coverage.status == "ok", coverage.summary
+
+
+def test_generated_data_has_a_timezone_aware_column(tmp_path) -> None:
+    import duckdb
+
+    from jellybean.datagen.telemetry import generate_telemetry
+
+    generate_telemetry(tmp_path / "d", tmp_path / "t", machines=100, days=8, seed=1)
+    kind = duckdb.sql(
+        f"SELECT typeof(register_synced_at) FROM '{tmp_path / 'd' / 'machines' / 'part-0.parquet'}' LIMIT 1"
+    ).fetchall()[0][0]
+    assert kind == "TIMESTAMP WITH TIME ZONE"
+

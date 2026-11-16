@@ -72,6 +72,7 @@ Asset register, one row per machine.
 | install_year | year of installation |
 | rated_kw | nominal power in kW |
 | criticality | business criticality (low, medium, high) |
+| register_synced_at | when the register entry was last synchronised (UTC, timezone-aware) |
 """,
 }
 
@@ -120,6 +121,10 @@ def generate_telemetry(
             "criticality": rng.choice(["low", "medium", "high"], n, p=[0.5, 0.35, 0.15]),
         }
     )
+    # Timezone-aware timestamp (TIMESTAMP WITH TIME ZONE in Parquet): keeps that type
+    # covered end to end. Derived from the asset number, so it draws nothing from the RNG.
+    last_sync = START.astype("datetime64[us]") - (ids % 97).astype("timedelta64[h]") - np.timedelta64(1, "h")
+    machines_df["register_synced_at"] = pd.Series(last_sync).dt.tz_localize("UTC")
 
     # ------------------------------------------------------------ roles (disjoint)
     perm = rng.permutation(n)
