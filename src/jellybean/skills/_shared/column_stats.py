@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import duckdb
 
@@ -106,10 +106,13 @@ def compute_column_stats(
     view: str,
     seed: int = 0,
     with_top: bool = True,
-    with_samples: bool = True,
+    with_samples: bool | Literal["classify"] = True,
     columns: list[str] | None = None,
 ) -> tuple[int, list[ColumnStats]]:
     """Compute statistics for every column of ``view`` in as few scans as possible.
+
+    ``with_samples="classify"`` samples only the columns whose classification reads
+    sample values (strings and two-valued columns): one scan fewer per other column.
 
     Returns:
         The row count and one :class:`ColumnStats` per column.
@@ -163,7 +166,8 @@ def compute_column_stats(
                     f"SELECT {q}, count(*) AS n FROM {view} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5"
                 ).fetchall()
             ]
-        if with_samples and col.non_null:
+        wanted = with_samples is True or (with_samples == "classify" and (col.family == "string" or col.distinct <= 2))
+        if wanted and col.non_null:
             col.sample_values = [
                 r[0]
                 for r in con.execute(

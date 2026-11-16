@@ -69,6 +69,18 @@ class LimitsConfig(_Section):
     max_rework_cycles: int = Field(2, ge=0)
 
 
+class ProfilingConfig(_Section):
+    """Limits that keep the profiler's checks cheap on large datasets."""
+
+    # Above this many rows the integrity checks run on the raw rows instead of a
+    # materialised copy of the distinct rows (exact duplicates are then not removed).
+    distinct_max_rows: int = Field(5_000_000, ge=0)
+    # Candidate relations are screened on a sample of about this many rows first.
+    sample_rows: int = Field(200_000, ge=100)
+    # Candidate relations tested per statement (two filtered aggregates each).
+    candidate_batch: int = Field(60, ge=1, le=500)
+
+
 class ToolOutputConfig(_Section):
     max_output_chars: int = Field(4000, ge=500)
     max_raw_rows: int = Field(20, ge=1)
@@ -163,6 +175,7 @@ class AppConfig(_Section):
     run: RunConfig = Field(default_factory=RunConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
+    profiling: ProfilingConfig = Field(default_factory=ProfilingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     join_confidence: JoinConfidenceConfig = Field(default_factory=JoinConfidenceConfig)
     pattern_registry: PatternRegistryConfig = Field(default_factory=PatternRegistryConfig)

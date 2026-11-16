@@ -25,10 +25,19 @@ its rows when the dataset is read with the alias ``x`` (``SELECT ... FROM
 them. Every check runs on the distinct rows of the dataset, so exact duplicate
 rows (reported by ``profile_table``) do not inflate the counts.
 Issues use the profiler's format, so ``compile_quality_issues`` merges them.
+
+Resource use. The distinct rows are materialised **once** per call in a temporary
+table (:func:`_working_rows`) and every later statement reads that table; it is
+never an inline ``SELECT DISTINCT *`` recomputed per statement. Datasets above
+``profiling.distinct_max_rows`` are read as they are (no copy, columns pruned by
+the scan), and the result says that exact duplicates were not removed. Where a
+problem concentrates is computed in one scan for all category columns
+(:func:`_cells`), not one scan per column.
 """
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 from typing import Annotated, Any
 
@@ -39,7 +48,7 @@ from jellybean.runtime.tool_registry import ToolResult, tool
 from jellybean.skills._shared.catalog import SourceNotFoundError, connect, quote_ident, resolve_source
 from jellybean.skills._shared.column_stats import ColumnStats, classify_column, compute_column_stats
 from jellybean.skills._shared.keys import is_valid_strategy, strategy_sql
-from jellybean.skills.profiler._common import _issue, _masker, _store
+from jellybean.skills.profiler._common import _issue, _masker, _settings, _store
 
 # Columns used to describe where problems concentrate: low-cardinality categories.
 _MAX_SEGMENT_VALUES = 50
@@ -48,13 +57,48 @@ _MAX_MEASURES = 12
 # A segment (category value x date) is systematic when most of its rows violate.
 _SEGMENT_RATE = 0.5
 _MIN_SEGMENT_ROWS = 10
+# Temporary tables of one call (dataset views never start with "_").
+_ROWS = "_jb_rows"
+_REF_ROWS = "_jb_ref_rows"
+_CELLS = "_jb_cells"
+_SAMPLE = "_jb_sample"
+# A candidate relation screened on a sample is kept when it holds this close to `min_share`
+# (two standard errors of a share near 0.95 on a few hundred rows).
+_SCREEN_MARGIN = 0.03
+# infer_sign_convention: a "category" with more values than this is not one.
+_MAX_SIGN_CATEGORIES = 200
+# discover_self_references: identifier columns compared (the ones with most distinct values).
+_MAX_KEY_COLUMNS = 16
 
 
 # --------------------------------------------------------------------------- #
 # Shared helpers                                                              #
 # --------------------------------------------------------------------------- #
-def _distinct(view: str) -> str:
-    return f"(SELECT DISTINCT * FROM {view})"
+def _working_rows(con: duckdb.DuckDBPyConnection, view: str, table: str = _ROWS) -> tuple[str, list[str]]:
+    """Relation every statement of a check reads, and the warnings to return with the result.
+
+    Up to ``profiling.distinct_max_rows`` rows: a temporary table with the distinct
+    rows, built once (dropped by :func:`_close`). Above it: the dataset itself, so
+    nothing is copied and each statement reads only its columns; exact duplicate
+    rows are then counted, which the warning says.
+    """
+    limit = _settings().config.profiling.distinct_max_rows
+    total = con.execute(f"SELECT count(*) FROM {view}").fetchall()[0][0]
+    if total > limit:
+        return view, [
+            f"Large dataset ({total:,} rows, above profiling.distinct_max_rows={limit:,}): exact duplicate rows "
+            "were not removed before this check, so they count in its figures."
+        ]
+    con.execute(f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT DISTINCT * FROM {view}")
+    return table, []
+
+
+def _close(con: duckdb.DuckDBPyConnection) -> None:
+    """Drop the temporary tables of a check and close its connection."""
+    for table in (_ROWS, _REF_ROWS, _CELLS, _SAMPLE):
+        with contextlib.suppress(duckdb.Error):
+            con.execute(f"DROP TABLE IF EXISTS {table}")
+    con.close()
 
 
 def _norm(column: str) -> str:
@@ -77,41 +121,68 @@ def _segment_columns(stats: list[ColumnStats], exclude: set[str] = frozenset()) 
     return out
 
 
-def _date_expr(stats: list[ColumnStats]) -> str | None:
-    """Day of each row: a ``date`` column, else the first timestamp column."""
+def _date_column(stats: list[ColumnStats]) -> str | None:
+    """Column giving the day of each row: a ``date`` column, else the first timestamp column."""
     by_name = {c.name: c for c in stats}
     if "date" in by_name and by_name["date"].family == "temporal":
-        return quote_ident("date") + "::DATE"
+        return "date"
     temporal = [c for c in stats if c.family == "temporal"]
-    return f"{quote_ident(temporal[0].name)}::DATE" if temporal else None
+    return temporal[0].name if temporal else None
 
 
-def _concentration(
+def _date_expr(stats: list[ColumnStats]) -> str | None:
+    """Day of each row, as a SQL expression."""
+    column = _date_column(stats)
+    return f"{quote_ident(column)}::DATE" if column else None
+
+
+def _cells(
     con: duckdb.DuckDBPyConnection, rel: str, flag: str, scope: str, columns: list[str], date: str | None
-) -> dict[str, Any]:
-    """Where the rows matching ``flag`` concentrate (within the rows of ``scope``).
+) -> None:
+    """Count flagged and total rows per (category column, value, day), in one scan of ``rel``.
+
+    Fills the temporary table ``_jb_cells(col, v, d, f, n)``: ``col`` is the index of
+    the category column in ``columns`` (``-1``: no column, i.e. the totals per day),
+    ``v`` its normalised value, ``d`` the day (null without ``date``), ``f`` the rows
+    matching ``flag`` and ``n`` all rows, both within ``scope``. Each row is counted
+    once per category column while it streams by, so the cost is one scan whatever
+    the number of columns.
+    """
+    values = ", ".join(["CAST(NULL AS VARCHAR)", *(_norm(c) for c in columns)])
+    index = ", ".join(str(i) for i in range(-1, len(columns)))
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE {_CELLS} AS "
+        "SELECT _jb_col AS col, _jb_v AS v, _jb_d AS d, count(*) FILTER (WHERE _jb_f) AS f, count(*) AS n FROM ("
+        f"SELECT unnest([{values}]) AS _jb_v, unnest([{index}]) AS _jb_col, {date or 'NULL'} AS _jb_d, "
+        f"coalesce(({flag}), false) AS _jb_f FROM {rel} WHERE {scope}) GROUP BY ALL"
+    )
+
+
+def _concentration_of(con: duckdb.DuckDBPyConnection, columns: list[str], date: str | None) -> dict[str, Any]:
+    """Where the flagged rows of the last :func:`_cells` concentrate.
 
     Returns, for the best category column, the value holding the largest share of
     flagged rows and its lift over the base share, plus the top dates.
     """
-    best: dict[str, Any] = {}
-    total = con.execute(f"SELECT count(*) FROM {rel} WHERE {scope} AND {flag}").fetchall()[0][0]
+    total, base_rows = con.execute(
+        f"SELECT coalesce(sum(f), 0), coalesce(sum(n), 0) FROM {_CELLS} WHERE col = -1"
+    ).fetchall()[0]
     if not total:
         return {}
-    base_rows = con.execute(f"SELECT count(*) FROM {rel} WHERE {scope}").fetchall()[0][0]
-    for col in columns:
-        row = con.execute(
-            f"SELECT {_norm(col)} v, count(*) FILTER (WHERE {flag}) f, count(*) n FROM {rel} WHERE {scope} "
-            "GROUP BY 1 ORDER BY f DESC, v LIMIT 1"
-        ).fetchall()
-        if not row or row[0][1] == 0:
+    tops = con.execute(
+        "SELECT col, v, f, n FROM (SELECT col, v, sum(f) AS f, sum(n) AS n, "
+        "row_number() OVER (PARTITION BY col ORDER BY sum(f) DESC, v) AS r "
+        f"FROM {_CELLS} WHERE col >= 0 GROUP BY col, v) WHERE r = 1 ORDER BY col"
+    ).fetchall()
+    best: dict[str, Any] = {}
+    for col, value, flagged, n in tops:
+        if not flagged:
             continue
-        value, flagged, n = row[0]
-        share, base = flagged / total, n / base_rows
+        share, base = int(flagged) / int(total), int(n) / int(base_rows)
         lift = share / base if base else 0.0
         if share >= 0.5 and lift > best.get("lift", 1.5):
             best = {
-                "column": col,
+                "column": columns[col],
                 "value": value,
                 "share": round(share, 4),
                 "base_share": round(base, 4),
@@ -121,37 +192,45 @@ def _concentration(
     if best:
         out["segment"] = best
     if date:
-        dates = con.execute(
-            f"SELECT {date} d, count(*) FROM {rel} WHERE {scope} AND {flag} GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5"
-        ).fetchall()
-        n_dates = con.execute(f"SELECT count(DISTINCT {date}) FROM {rel} WHERE {scope} AND {flag}").fetchall()[0][0]
+        dates = con.execute(f"SELECT d, f FROM {_CELLS} WHERE col = -1 AND f > 0 ORDER BY f DESC, d LIMIT 5").fetchall()
+        n_dates = con.execute(f"SELECT count(d) FROM {_CELLS} WHERE col = -1 AND f > 0").fetchall()[0][0]
         out["dates"] = {"distinct": int(n_dates), "top": [[str(d), int(n)] for d, n in dates]}
     return out
 
 
-def _systematic_segment(
+def _concentration(
     con: duckdb.DuckDBPyConnection, rel: str, flag: str, scope: str, columns: list[str], date: str | None
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
+    """Where the rows matching ``flag`` concentrate (within the rows of ``scope``): one scan."""
+    _cells(con, rel, flag, scope, columns, date)
+    return _concentration_of(con, columns, date)
+
+
+def _systematic_of(con: duckdb.DuckDBPyConnection, columns: list[str], date: str | None) -> dict[str, Any] | None:
     """The (category value x dates) block where most rows are flagged, if it explains many flagged rows.
 
-    A cell (value, day) is systematic when at least half of its rows are flagged
-    and it has at least ``_MIN_SEGMENT_ROWS`` flagged rows. The column whose
-    systematic cells cover the most flagged rows wins.
+    Reads the last :func:`_cells`. A cell (value, day) is systematic when at least
+    half of its rows are flagged and it has at least ``_MIN_SEGMENT_ROWS`` flagged
+    rows. The column whose systematic cells cover the most flagged rows wins.
     """
     if not date:
         return None
-    total = con.execute(f"SELECT count(*) FROM {rel} WHERE {scope} AND {flag}").fetchall()[0][0]
+    total = int(con.execute(f"SELECT coalesce(sum(f), 0) FROM {_CELLS} WHERE col = -1").fetchall()[0][0])
+    rows = con.execute(
+        f"SELECT col, v, d, f, n FROM {_CELLS} WHERE col >= 0 AND d IS NOT NULL "
+        f"AND f >= {_MIN_SEGMENT_ROWS} AND f >= {_SEGMENT_RATE} * n ORDER BY col, v, d"
+    ).fetchall()
+    by_column: dict[int, list[tuple[Any, Any, int, int]]] = {}
+    for col, v, d, f, n in rows:
+        by_column.setdefault(col, []).append((v, d, int(f), int(n)))
     best = None
-    for col in columns:
-        cells = con.execute(
-            f"SELECT {_norm(col)} v, {date} d, count(*) FILTER (WHERE {flag}) f, count(*) n FROM {rel} "
-            f"WHERE {scope} GROUP BY 1, 2 HAVING f >= {_MIN_SEGMENT_ROWS} AND f >= {_SEGMENT_RATE} * n"
-        ).fetchall()
+    for col in sorted(by_column):
+        cells = by_column[col]
         covered = sum(c[2] for c in cells)
-        if cells and (best is None or covered > best["rows"]):
+        if best is None or covered > best["rows"]:
             values = sorted({c[0] for c in cells}, key=str)
             dates = sorted({str(c[1]) for c in cells})
-            best = {"column": col, "values": values, "dates": dates, "rows": int(covered), "cells": cells}
+            best = {"column": columns[col], "values": values, "dates": dates, "rows": int(covered), "cells": cells}
     if best is None or best["rows"] < max(_MIN_SEGMENT_ROWS * 3, 0.2 * total):
         return None
     cells = best.pop("cells")
@@ -170,8 +249,30 @@ def _resolve(dataset: str) -> tuple[Any, duckdb.DuckDBPyConnection] | ToolResult
     return source, connect()
 
 
+def _null_groups(
+    con: duckdb.DuckDBPyConnection, rel: str, columns: list[str], determinant: str
+) -> dict[str, list[tuple[Any, int, int]]]:
+    """Rows and nulls of every column in ``columns`` per value of ``determinant``.
+
+    One scan for all the columns (in batches of 100), instead of one per column.
+    Returns ``{column: [(value, rows, nulls), ...]}``.
+    """
+    out: dict[str, list[tuple[Any, int, int]]] = {c: [] for c in columns}
+    for start in range(0, len(columns), 100):
+        chunk = columns[start : start + 100]
+        counts = ", ".join(f"count(*) - count({quote_ident(c)})" for c in chunk)
+        for row in con.execute(f"SELECT {_norm(determinant)} v, count(*) n, {counts} FROM {rel} GROUP BY 1").fetchall():
+            for i, c in enumerate(chunk):
+                out[c].append((row[0], int(row[1]), int(row[2 + i])))
+    return out
+
+
 def null_structure(
-    con: duckdb.DuckDBPyConnection, rel: str, column: str, determinants: list[str]
+    con: duckdb.DuckDBPyConnection,
+    rel: str,
+    column: str,
+    determinants: list[str],
+    groups: dict[str, dict[str, list[tuple[Any, int, int]]]] | None = None,
 ) -> dict[str, Any] | None:
     """Explain the nulls of ``column`` by a category column, if one determines them.
 
@@ -180,21 +281,21 @@ def null_structure(
     filled groups are unexpected (errors). The determinant explaining the most
     nulls with the fewest exceptions wins.
 
+    ``groups`` are precomputed counts (``{determinant: _null_groups(...)}``) when
+    many columns are classified at once; without them each determinant is one query.
+
     Returns ``None`` when no determinant puts at least 95% of the nulls in null groups.
     """
-    q = quote_ident(column)
     best = None
     for det in determinants:
         if det == column:
             continue
-        groups = con.execute(
-            f"SELECT {_norm(det)} v, count(*) n, count(*) - count({q}) nulls FROM {rel} GROUP BY 1"
-        ).fetchall()
-        nulls = sum(g[2] for g in groups)
-        if not nulls or any(g[0] is None for g in groups):
+        counted = groups[det][column] if groups is not None else _null_groups(con, rel, [column], det)[column]
+        nulls = sum(g[2] for g in counted)
+        if not nulls or any(g[0] is None for g in counted):
             continue
-        null_groups = [g for g in groups if g[2] >= 0.5 * g[1]]
-        filled_groups = [g for g in groups if g[2] < 0.5 * g[1]]
+        null_groups = [g for g in counted if g[2] >= 0.5 * g[1]]
+        filled_groups = [g for g in counted if g[2] < 0.5 * g[1]]
         if not null_groups or not filled_groups:
             continue
         explained = sum(g[2] for g in null_groups)
@@ -202,7 +303,7 @@ def null_structure(
         unexpected_values = sum(g[1] - g[2] for g in null_groups)
         if explained < 0.95 * nulls:
             continue
-        score = (unexpected_nulls + unexpected_values, len(groups))
+        score = (unexpected_nulls + unexpected_values, len(counted))
         if best is None or score < best["_score"]:
             best = {
                 "_score": score,
@@ -215,10 +316,12 @@ def null_structure(
                     ([str(g[0]), int(g[2])] for g in filled_groups if g[2]), key=lambda x: -x[1]
                 ),
                 "unexpected_values": int(unexpected_values),
+                "_applicable": int(sum(g[1] for g in filled_groups)),
             }
     if best is None:
         return None
     best.pop("_score")
+    best["applicable_rows"] = best.pop("_applicable")
     best["classification"] = "structural" if best["unexpected_nulls"] == 0 else "structural_with_errors"
     return best
 
@@ -235,9 +338,30 @@ def _short(values: list[Any], n: int = 6) -> list[Any] | dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # discover_arithmetic_invariants                                              #
 # --------------------------------------------------------------------------- #
+def _count_candidates(
+    con: duckdb.DuckDBPyConnection, rel: str, candidates: list[dict[str, Any]], batch: int
+) -> list[tuple[int, int]]:
+    """Rows where each candidate relation applies and where it holds, ``batch`` candidates per statement."""
+    out: list[tuple[int, int]] = []
+    for start in range(0, len(candidates), batch):
+        chunk = candidates[start : start + batch]
+        aggregates = []
+        for cand in chunk:
+            aggregates += [
+                f"count(*) FILTER (WHERE {cand['present']})",
+                f"count(*) FILTER (WHERE {cand['present']} AND {cand['holds']})",
+            ]
+        row = con.execute(f"SELECT {', '.join(aggregates)} FROM {rel}").fetchall()[0]
+        out += [(int(row[2 * i]), int(row[2 * i + 1])) for i in range(len(chunk))]
+    return out
+
+
 @tool
 def discover_arithmetic_invariants(
-    dataset: str, columns: list[str] | None = None, min_share: Annotated[float, Field(gt=0.5, le=1)] = 0.95
+    dataset: str,
+    columns: list[str] | None = None,
+    min_share: Annotated[float, Field(gt=0.5, le=1)] = 0.95,
+    seed: int | None = None,
 ) -> ToolResult:
     """Find arithmetic relations between measures that hold on almost every row, and their violations.
 
@@ -247,20 +371,22 @@ def discover_arithmetic_invariants(
     (category value, dates) and separates a systematic block (one category value
     on some dates, most of its rows violating; with the sign flip that explains
     it, if any) from scattered violations. Violations become quality issues; they
-    are never findings for the detector.
+    are never findings for the detector. On large datasets the candidate relations
+    are screened on a sample first; the reported counts are always exact.
 
     Args:
         dataset: Dataset name or table artifact id.
         columns: Measures to test (default: every numeric measure, at most 12).
         min_share: Minimum share of rows where a relation must hold.
+        seed: Seed of the screening sample (defaults to the run seed).
     """
     opened = _resolve(dataset)
     if isinstance(opened, ToolResult):
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         by_name = {c.name: c for c in stats}
         if columns:
             unknown = [c for c in columns if c not in by_name or by_name[c].family not in ("integer", "float")]
@@ -308,17 +434,26 @@ def discover_arithmetic_invariants(
                     "present": present(a),
                 }
             )
-        aggregates = []
-        for cand in candidates:
-            aggregates += [
-                f"count(*) FILTER (WHERE {cand['present']})",
-                f"count(*) FILTER (WHERE {cand['present']} AND {cand['holds']})",
+        # Screen the candidates on a sample when the table is large: most of them fail
+        # clearly, and only the survivors are counted exactly on every row.
+        profiling = _settings().config.profiling
+        if rows > profiling.sample_rows and candidates:
+            keep = max(1, round(1_000_000 * profiling.sample_rows / rows))
+            cols = ", ".join(quote_ident(m) for m in measures)
+            con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {_SAMPLE} AS SELECT {cols} FROM {rel} AS _t "
+                f"WHERE hash(_t, {int(seed or 0)}) % 1000000 < {keep}"
+            )
+            sampled = _count_candidates(con, _SAMPLE, candidates, profiling.candidate_batch)
+            candidates = [
+                c
+                for c, (n, ok) in zip(candidates, sampled, strict=True)
+                if n and ok >= (min_share - _SCREEN_MARGIN) * n
             ]
-        counts = con.execute(f"SELECT {', '.join(aggregates)} FROM {rel}").fetchall()[0] if aggregates else []
+        counts = _count_candidates(con, rel, candidates, profiling.candidate_batch)
         held = []
         min_rows = max(20, int(0.001 * rows))
-        for i, cand in enumerate(candidates):
-            n, ok = counts[2 * i], counts[2 * i + 1]
+        for cand, (n, ok) in zip(candidates, counts, strict=True):
             if n < min_rows or ok < min_share * n:
                 continue
             if cand["kind"] == "equal" and ok == n and by_name[cand["terms"][0]].distinct == 1:
@@ -349,24 +484,21 @@ def discover_arithmetic_invariants(
                 continue
             flag = f"NOT ({inv['holds']})"
             scope = inv["present"]
-            inv["concentration"] = _concentration(con, rel, flag, scope, segments, date)
-            systematic = (
-                _systematic_segment(con, rel, flag, scope, segments, date) if inv["kind"] != "non_negative" else None
-            )
+            # One scan gives both where the violations concentrate and the systematic block.
+            _cells(con, rel, flag, scope, segments, date)
+            inv["concentration"] = _concentration_of(con, segments, date)
+            systematic = _systematic_of(con, segments, date) if inv["kind"] != "non_negative" else None
             scattered = inv["violations"]
             if systematic:
                 if inv["kind"] == "sum":
                     x, y, z = inv["terms"]
-                    flips = {}
-                    for flipped, expr in (
-                        (y, f"abs({quote_ident(x)} - {quote_ident(y)} - {quote_ident(z)}) <= {tol}"),
-                        (x, f"abs({quote_ident(y)} - {quote_ident(x)} - {quote_ident(z)}) <= {tol}"),
-                    ):
-                        n_flip = con.execute(
-                            f"SELECT count(*) FROM {rel} WHERE {scope} AND {flag} "
-                            f"AND {systematic['predicate']} AND {expr}"
-                        ).fetchall()[0][0]
-                        flips[flipped] = n_flip
+                    flip_y = f"abs({quote_ident(x)} - {quote_ident(y)} - {quote_ident(z)}) <= {tol}"
+                    flip_x = f"abs({quote_ident(y)} - {quote_ident(x)} - {quote_ident(z)}) <= {tol}"
+                    n_y, n_x = con.execute(
+                        f"SELECT count(*) FILTER (WHERE {flip_y}), count(*) FILTER (WHERE {flip_x}) FROM {rel} "
+                        f"WHERE {scope} AND {flag} AND {systematic['predicate']}"
+                    ).fetchall()[0]
+                    flips = {y: n_y, x: n_x}
                     column, n_flip = max(flips.items(), key=lambda kv: kv[1])
                     if n_flip >= 0.9 * systematic["rows"]:
                         systematic["sign_flipped"] = {"column": column, "share": round(n_flip / systematic["rows"], 4)}
@@ -405,7 +537,7 @@ def discover_arithmetic_invariants(
                     )
                 )
     finally:
-        con.close()
+        _close(con)
     for inv in held:
         inv.pop("holds"), inv.pop("present")
     record = _store().save_json(
@@ -447,7 +579,7 @@ def discover_arithmetic_invariants(
             ],
         },
         artifact_id=record.id,
-        warnings=[] if relations else ["No relation between measures holds on most rows."],
+        warnings=[*notes, *([] if relations else ["No relation between measures holds on most rows."])],
     )
 
 
@@ -479,7 +611,8 @@ def check_referential_integrity(
         return ToolResult.error(str(exc))
     con = connect()
     try:
-        rel, ref_rel = _distinct(src.view), _distinct(ref.view)
+        rel, notes = _working_rows(con, src.view)
+        ref_rel = rel if ref.name == src.name else _working_rows(con, ref.view, _REF_ROWS)[0]
         _, stats = compute_column_stats(con, rel, with_top=False, with_samples=False)
         names = {c.name for c in stats}
         ref_names = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {ref.view}").fetchall()}
@@ -515,7 +648,7 @@ def check_referential_integrity(
         ]
         nulls = null_structure(con, rel, column, _segment_columns(stats)) if keyed < rows else None
     finally:
-        con.close()
+        _close(con)
     masker = _masker()
     sensitive = masker.is_sensitive_name(column) or masker.is_sensitive_values(examples)
     share = orphans / keyed if keyed else 0.0
@@ -566,7 +699,7 @@ def check_referential_integrity(
         parents=sorted({src.name, ref.name}),
         params={"normalization": normalization},
     )
-    return ToolResult.ok(result, artifact_id=record.id)
+    return ToolResult.ok(result, artifact_id=record.id, warnings=notes)
 
 
 # --------------------------------------------------------------------------- #
@@ -593,8 +726,8 @@ def find_duplicate_keys(dataset: str, columns: list[str] | None = None, min_uniq
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         by_name = {c.name: c for c in stats}
         if columns:
             missing = [c for c in columns if c not in by_name]
@@ -662,7 +795,7 @@ def find_duplicate_keys(dataset: str, columns: list[str] | None = None, min_uniq
                 )
             checks.append(entry)
     finally:
-        con.close()
+        _close(con)
     record = _store().save_json(
         f"duplicate_keys_{source.name}",
         {"dataset": source.name, "checks": checks, "issues": issues},
@@ -674,7 +807,7 @@ def find_duplicate_keys(dataset: str, columns: list[str] | None = None, min_uniq
             "checks": [{**c, "columns_that_differ": _short(c.get("columns_that_differ", []))} for c in checks],
         },
         artifact_id=record.id,
-        warnings=[] if keysets else ["No almost-unique identifier column to check; pass `columns`."],
+        warnings=[*notes, *([] if keysets else ["No almost-unique identifier column to check; pass `columns`."])],
     )
 
 
@@ -698,18 +831,21 @@ def classify_nulls(dataset: str) -> ToolResult:
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         determinants = [
             c
             for c in _segment_columns(stats)
             if next(s for s in stats if s.name == c).non_null == next(s for s in stats if s.name == c).rows
         ]
         results, issues = {}, []
+        # One scan per determinant counts the nulls of every column at once.
+        with_nulls = [c.name for c in stats if c.non_null < c.rows]
+        groups = {det: _null_groups(con, rel, with_nulls, det) for det in determinants} if with_nulls else {}
         for col in stats:
             if col.non_null == col.rows:
                 continue
-            found = null_structure(con, rel, col.name, determinants)
+            found = null_structure(con, rel, col.name, determinants, groups)
             if found is None:
                 results[col.name] = {"classification": "not_structural", "nulls": col.rows - col.non_null}
                 continue
@@ -727,10 +863,7 @@ def classify_nulls(dataset: str) -> ToolResult:
                 )
             )
             if found["unexpected_nulls"]:
-                applicable = con.execute(
-                    f"SELECT count(*) FROM {rel} WHERE {_norm(found['determined_by'])} IN "
-                    f"({', '.join(_lit(v) for v in found['filled_when'])})"
-                ).fetchall()[0][0]
+                applicable = found["applicable_rows"]
                 issues.append(
                     _issue(
                         source.name,
@@ -744,7 +877,7 @@ def classify_nulls(dataset: str) -> ToolResult:
                     )
                 )
     finally:
-        con.close()
+        _close(con)
     record = _store().save_json(
         f"nulls_{source.name}", {"dataset": source.name, "nulls": results, "issues": issues}, parents=[source.name]
     )
@@ -763,7 +896,7 @@ def classify_nulls(dataset: str) -> ToolResult:
         }
         for name, r in results.items()
     }
-    return ToolResult.ok({"dataset": source.name, "columns": compact}, artifact_id=record.id)
+    return ToolResult.ok({"dataset": source.name, "columns": compact}, artifact_id=record.id, warnings=notes)
 
 
 # --------------------------------------------------------------------------- #
@@ -788,20 +921,35 @@ def infer_sign_convention(dataset: str, measure: str, category: str) -> ToolResu
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         by_name = {c.name: c for c in stats}
         if measure not in by_name or by_name[measure].family not in ("integer", "float"):
             return ToolResult.error(f"'{measure}' is not a numeric column of '{source.name}'")
         if category not in by_name:
             return ToolResult.error(f"Unknown column '{category}'")
+        if by_name[category].distinct > _MAX_SIGN_CATEGORIES:
+            return ToolResult.error(
+                f"'{category}' has {by_name[category].distinct:,} distinct values: not a category. "
+                f"Pass a low-cardinality column (at most {_MAX_SIGN_CATEGORIES} values)."
+            )
         m = quote_ident(measure)
         rows = con.execute(
             f"SELECT {_norm(category)} v, count({m}) n, count(*) FILTER (WHERE {m} > 0) pos, "
             f"count(*) FILTER (WHERE {m} < 0) neg FROM {rel} GROUP BY 1 ORDER BY n DESC"
         ).fetchall()
         date = _date_expr(stats)
-        n_dates = con.execute(f"SELECT count(DISTINCT {date}) FROM {rel}").fetchall()[0][0] if date else 0
+        # Signs per (value, day) for every value at once, instead of one query per value.
+        per_day: dict[Any, list[tuple[Any, int, int]]] = {}
+        n_dates = 0
+        if date:
+            signs = con.execute(
+                f"SELECT {_norm(category)} v, {date} d, count(*) FILTER (WHERE {m} > 0), "
+                f"count(*) FILTER (WHERE {m} < 0) FROM {rel} GROUP BY 1, 2"
+            ).fetchall()
+            n_dates = len({d for _, d, _, _ in signs if d is not None})
+            for v, d, pos_d, neg_d in signs:
+                per_day.setdefault(v, []).append((d, int(pos_d), int(neg_d)))
         others = _segment_columns(stats, exclude={category, measure})
         values, inversions = [], []
         for v, n, pos, neg in rows:
@@ -829,9 +977,10 @@ def infer_sign_convention(dataset: str, measure: str, category: str) -> ToolResu
                 continue
             op = "<" if dominant == "positive" else ">"
             flag = f"{_norm(category)} = {_lit(v)} AND {m} {op} 0"
-            by_date = con.execute(
-                f"SELECT {date}, count(*) FROM {rel} WHERE {flag} GROUP BY 1 ORDER BY 2 DESC, 1"
-            ).fetchall()
+            minority_by_day = [
+                (d, neg_d if dominant == "positive" else pos_d) for d, pos_d, neg_d in per_day.get(v, [])
+            ]
+            by_date = sorted(((d, k) for d, k in minority_by_day if k), key=lambda x: (-x[1], x[0] is None, str(x[0])))
             covered, chosen = 0, []
             for d, k in by_date:
                 chosen.append(str(d))
@@ -850,7 +999,7 @@ def infer_sign_convention(dataset: str, measure: str, category: str) -> ToolResu
                     }
                 )
     finally:
-        con.close()
+        _close(con)
     # One issue per group of values inverted on the same dates (a single systematic error).
     issues = []
     groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
@@ -891,6 +1040,7 @@ def infer_sign_convention(dataset: str, measure: str, category: str) -> ToolResu
             "inversions": inversions[:6],
         },
         artifact_id=record.id,
+        warnings=notes,
     )
 
 
@@ -915,8 +1065,8 @@ def discover_self_references(dataset: str, min_coverage: float = 0.9) -> ToolRes
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         keys = [
             c
             for c in stats
@@ -924,15 +1074,27 @@ def discover_self_references(dataset: str, min_coverage: float = 0.9) -> ToolRes
             and classify_column(c).semantic_type == "identifier"
             and c.distinct >= 20
         ]
-        for i, c in enumerate(keys):
+        if len(keys) > _MAX_KEY_COLUMNS:
+            kept = {c.name for c in sorted(keys, key=lambda c: -c.distinct)[:_MAX_KEY_COLUMNS]}
+            notes.append(
+                f"{len(keys)} identifier columns: only the {_MAX_KEY_COLUMNS} with most distinct values were compared."
+            )
+            keys = [c for c in keys if c.name in kept]
+        # A column can only be covered by a target with enough distinct values: pairs that
+        # cannot reach `min_coverage` are dropped before any value is read.
+        pairs = [
+            ((i, a), (j, b))
+            for (i, a), (j, b) in itertools.permutations(enumerate(keys), 2)
+            if a.family == b.family and b.distinct >= min_coverage * a.distinct
+        ]
+        for i in sorted({i for pair in pairs for i, _ in pair}):
+            c = keys[i]
             con.execute(
                 f"CREATE TEMP TABLE _s{i} AS SELECT DISTINCT CAST({quote_ident(c.name)} AS VARCHAR) v "
                 f"FROM {rel} WHERE {quote_ident(c.name)} IS NOT NULL"
             )
         found = []
-        for (i, a), (j, b) in itertools.permutations(enumerate(keys), 2):
-            if a.family != b.family:
-                continue
+        for (i, a), (j, b) in pairs:
             common = con.execute(f"SELECT count(*) FROM _s{i} JOIN _s{j} USING (v)").fetchall()[0][0]
             coverage = common / a.distinct if a.distinct else 0.0
             if coverage < min_coverage:
@@ -950,11 +1112,11 @@ def discover_self_references(dataset: str, min_coverage: float = 0.9) -> ToolRes
                 }
             )
     finally:
-        con.close()
+        _close(con)
     record = _store().save_json(
         f"self_references_{source.name}", {"dataset": source.name, "candidates": found}, parents=[source.name]
     )
-    return ToolResult.ok({"dataset": source.name, "candidates": found[:10]}, artifact_id=record.id)
+    return ToolResult.ok({"dataset": source.name, "candidates": found[:10]}, artifact_id=record.id, warnings=notes)
 
 
 @tool
@@ -983,8 +1145,8 @@ def check_reciprocity(
         return opened
     source, con = opened
     try:
-        rel = _distinct(source.view)
-        _, stats = compute_column_stats(con, rel, with_top=False, with_samples=True)
+        rel, notes = _working_rows(con, source.view)
+        _, stats = compute_column_stats(con, rel, with_top=False, with_samples="classify")
         names = {c.name for c in stats}
         for c in (column, counterpart_column, time_column):
             if c and c not in names:
@@ -999,8 +1161,14 @@ def check_reciprocity(
         if time_column:
             t = quote_ident(time_column)
             lag = f" AND abs(epoch(o.{t}) - epoch(x.{t})) <= {int(max_lag_seconds)}"
+        # Only the columns used below are copied: the pair, the time and the segment/day columns.
+        segments = _segment_columns(stats, exclude={column, counterpart_column})
+        used = dict.fromkeys(
+            [column, counterpart_column, *([time_column] if time_column else []), *segments, _date_column(stats)]
+        )
+        kept = ", ".join(quote_ident(c) for c in used if c)
         con.execute(
-            f"CREATE TEMP TABLE _pairs AS SELECT row_number() OVER () AS _rid, * FROM {rel} WHERE {b} IS NOT NULL"
+            f"CREATE TEMP TABLE _pairs AS SELECT row_number() OVER () AS _rid, {kept} FROM {rel} WHERE {b} IS NOT NULL"
         )
         con.execute(
             f"CREATE TEMP TABLE _missing AS SELECT x._rid FROM _pairs x WHERE NOT EXISTS "
@@ -1009,14 +1177,13 @@ def check_reciprocity(
         total, missing = con.execute(
             "SELECT (SELECT count(*) FROM _pairs), (SELECT count(*) FROM _missing)"
         ).fetchall()[0]
-        segments = _segment_columns(stats, exclude={column, counterpart_column})
         conc = (
             _concentration(con, "_pairs", "_rid IN (SELECT _rid FROM _missing)", "TRUE", segments, _date_expr(stats))
             if missing
             else {}
         )
     finally:
-        con.close()
+        _close(con)
     issues = []
     if missing:
         issues.append(
@@ -1061,4 +1228,4 @@ def check_reciprocity(
         },
         parents=[source.name],
     )
-    return ToolResult.ok(result, artifact_id=record.id)
+    return ToolResult.ok(result, artifact_id=record.id, warnings=notes)

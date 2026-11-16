@@ -14,6 +14,11 @@ tool_output:
   max_output_chars: 4000           # hard cap on a serialised ToolResult
   max_raw_rows: 20                 # hard cap on raw data rows returned by any tool
 
+profiling:                         # keeps the profiler's checks cheap on large datasets
+  distinct_max_rows: 5000000       # above this, integrity checks use the raw rows (exact duplicates not removed)
+  sample_rows: 200000              # candidate relations are screened on a sample of about this size first
+  candidate_batch: 60              # candidate relations tested per SQL statement
+
 llm:                               # provider, model and key are set in .env
   max_tokens: 4096                 # max output tokens per model call
   temperature: null                # null = provider default
