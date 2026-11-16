@@ -167,7 +167,9 @@ def phase4_pipeline(dummy_base: Path, tmp_path_factory: pytest.TempPathFactory) 
         out["graph"] = fe.build_graph(out["join"].artifact_id, "msisdn", ["imei"], features=features.artifact_id)
         out["scaled"] = fe.scale_encode(out["graph"].summary["features_table"])
         out["embedding"] = fe.reduce_dimensions(out["scaled"].artifact_id, "pca", 10)
-        yield out
+    # Outside the ``with``: a session fixture that yields inside it would leave this run
+    # active for every later test of the session (tests activate it with ``use_run``).
+    yield out
 
 
 def verdict_policy(f: Any) -> str:
