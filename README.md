@@ -88,8 +88,14 @@ so the file is optional.
 - `limits.tool_timeout_s`: at the timeout the tool's queries are interrupted and
   the tool is stopped. Ctrl+C does the same and returns the prompt.
 - `profiling.*` and the size caps in `detection.*` (`cluster_max_rows`,
-  `group_max_pool`, `plot_max_points`): above these sizes a step samples, or
-  approximates, and says so in a warning.
+  `group_max_pool`, `plot_max_points`, `fit_max_rows`,
+  `exact_population_max_rows`, `surrogate_max_rows`, `max_candidates_per_run`,
+  `graph_max_edges`): above these sizes a step samples, approximates or
+  refuses, and says so in a warning or an error. Below them the results are
+  exact.
+
+The feature tables are never loaded whole to look at one group: the critic and
+the analyst read only the rows of a finding and the columns they need.
 
 What is still expensive on large data is listed in
 [docs/performance-audit.md](docs/performance-audit.md).

@@ -12,9 +12,13 @@ Review of `src/jellybean/` for code that does not scale to large datasets
 - **Measured:** the profiler tools, on a synthetic `subscribers_events` dataset of 6M rows,
   1.7M entities, 12 measures and a timezone-aware timestamp. The real dataset was not
   available on the development machine.
-- **Not measured:** everything after the profiler (features, detection, critic, analyst,
-  report). Their memory figures below are estimates from reading the code:
-  one copy of a 2.3M x 200 `float64` feature matrix is about 3.7 GB.
+- **Measured in the second pass:** the shared pieces of the later stages (feature-table
+  reads, effect sizes, signatures, ECOD, HBOS, scaling), on synthetic feature tables of
+  1M entities and 120 features (about 1 GB per table in memory). The development machine
+  has 11 GB of RAM, so 2.3M entities could not be tried.
+- **Not measured:** whole runs of the feature, detection, critic and analyst stages on
+  large data. Where a figure below is not in the measurement tables, it is an estimate from
+  reading the code: one copy of a 2.3M x 200 `float64` feature matrix is about 3.7 GB.
 
 Line numbers are the line of the function definition at the time of writing.
 
@@ -37,8 +41,10 @@ fails. Before, a heavy tool could freeze the machine; now it returns an error.
 | Real timeouts | `runtime/tool_registry.py:411` `_run_with_timeout`, `runtime/cancellation.py` | At the timeout the tool's queries are interrupted and its connections closed. A timed-out tool no longer keeps running under the agent's retry. |
 
 **Limit of this protection:** it covers DuckDB only. Memory used by pandas, numpy and
-scikit-learn in the same process is not capped by anything, and pure-Python work cannot be
-interrupted (the agent gets its error at the timeout, but the thread runs on).
+scikit-learn in the same process is not capped by anything. Pure-Python work is stopped
+only where the code checks for cancellation: the loops over blocks of columns, row groups
+and scoring batches added in the second pass do; a single long library call (one model
+fit) does not, and runs to its end after the agent got its timeout error.
 
 ## Measurements (profiler stage, 6M rows)
 
@@ -50,7 +56,7 @@ interrupted (the agent gets its error at the timeout, but the thread runs on).
 
 The 600 MB limit stands in for a dataset about seven times larger under the default 4 GB limit.
 
-## High-risk findings fixed in this pass
+## High-risk findings fixed in the first pass
 
 | File | Line | Function | Problem | Fix applied |
 | --- | --- | --- | --- | --- |
@@ -76,49 +82,83 @@ The 600 MB limit stands in for a dataset about seven times larger under the defa
 | `skills/detector/tools.py` | 525 | `_group_entities` | Dense pairwise distance matrix with no cap on the pool (46,000 entities need 8.5 GB). | Only the `detection.group_max_pool` most deviating entities are grouped. |
 | `skills/_shared/plots.py` | 73, 134 | `cluster_map`, `findings_map` | Every entity drawn; a figure leaked when drawing failed. | Population thinned to `detection.plot_max_points` (members and small clusters always drawn); figures closed on failure. |
 
-## High-risk findings deferred
+## Second pass: stages after the profiler
 
-**Why they are deferred, for all rows of this table:**
+The first pass deferred every high-risk finding outside the profiler. They are fixed here,
+under one rule: **below a size threshold the result is the same as before** (the acceptance
+tests did not change), and above it the tool samples or caps and says so in a warning.
+`tests/test_pipeline_resources.py` keeps the replaced implementations as references and
+checks that the new code gives the same values.
 
-- They are in the stages after the profiler, which the reported run never reached, and they
-  could not be exercised on real data here.
-- Their fixes change what the models see (sampling, approximations, fewer columns), so they
-  change the detection results. The acceptance tests pin those results; each fix needs its
-  own validation against them.
-- Since Task 5 the DuckDB part of each fails with a clear error instead of hanging. The
-  pandas part is still unbounded: these tools can still exhaust memory at 2.3M entities.
+### Measurements (1M entities, 120 features)
 
-| File | Line | Function | Problem | Proposed fix |
-| --- | --- | --- | --- | --- |
-| `skills/_shared/findings.py` | 134 | `feature_tables` | Loads raw and scaled tables in full (about 7.4 GB) on every call; 11 call sites, most need one table, a few columns or only the members. | Separate loaders with column and member filters pushed into the Parquet read; store `float32`. |
-| `skills/_shared/findings.py` | 176 | `effect_sizes` | Copies the population and recomputes its medians for every finding. | Compute population statistics once per feature table and store them; read only the members per finding. |
-| `skills/_shared/findings.py` | 236 | `signature` | Callers load both tables to get the median of the members' rows. | Read the members only. |
-| `skills/_shared/detection.py` | 23 | `outlier_scores` (ecod, hbos) | The libraries keep several full-size matrices (an estimated 15 to 22 GB for ECOD). | Both are column-separable: accumulate the score column by column. |
-| `skills/_shared/detection.py` | 23 | `outlier_scores` (lof) | Fit is capped at 50,000 rows, but all rows are scored by brute force. | Score on the PCA embedding, or against a smaller reference. |
-| `skills/_shared/detection.py` | 23 | `outlier_scores` (autoencoder) | Trains on every row for 20 epochs. | Fit on a seeded sample, score in batches. |
-| `skills/_shared/detection.py` | 138, 173 | `context_defining_features`, `contextual_scores` | Six to seven full-size temporary matrices. | Compute on a seeded sample or column by column. |
-| `skills/_shared/detection.py` | 330 | `grouped_series_anomalies` | A Python loop builds one frame per group; groups are not capped. | Build the grid vectorised; cap the groups with a warning. |
-| `skills/detector/tools.py` | 67, 89, 440 | `_load_matrix`, `run_outlier_detector`, `run_contextual_outliers` | Full tables read, every method run on every row. | Read only the needed columns as `float32`; apply the fixes above. |
-| `skills/detector/tools.py` | 257 | `run_graph_analysis` | Every edge into pandas, then networkx; pure-Python community detection. | Sparse connected components on integer codes; cap edges for community detection. |
-| `skills/detector/tools.py` | 556 | `consolidate_findings` | Holds both feature tables; pairwise merge loop over uncapped candidates. | Load the columns of the current family only; cap candidates per type before merging. |
-| `skills/critico/tools.py` | 99, 168 | `_redetect`, `stability_check` | Matrices re-read inside the repetition loop; every method refitted on 80% of the entities per repetition and per finding, although the subsamples are the same for all findings. | Load once; compute the re-detection once per repetition and reuse it for all findings. |
-| `skills/critico/tools.py` | 379 | `artifact_check` | 50 to 90 scans of the source per finding (one or two per column), plus both feature tables loaded twice. | Materialise the finding's rows once; one statement for all columns; cache the population side per run. |
-| `skills/critico/tools.py` | 636, 888, 829 | `_rule_on_windows`, `_rule_relation`, `_attribution` | Full-width `SELECT DISTINCT *` of the enriched table, self-joined, repeated per rule and per reference key. | Deduplicate only the key and the referenced columns; materialise the violating rows once per rule. |
-| `skills/critico/tools.py` | 934 | `inject_synthetic_anomalies` | Full extra copy of the matrix; every method refitted on all rows. | Fit on a seeded sample plus the planted rows. |
-| `skills/critico/tools.py` | 672, 1033 | `explain_by_reference`, `match_pattern_registry` | Both feature tables loaded for a few columns or one centroid. | Members-only and column-only reads. |
-| `skills/analista/tools.py` | 125 | `fit_surrogate_rules` | Uncapped one-hot encoding and two trees on every row (an estimated 16 GB). | Train on the members plus a seeded sample; cap the encoded levels. |
-| `skills/analista/tools.py` | 61, 203, 367 | `describe_group`, `get_exemplars`, `register_pattern` | Both feature tables loaded to describe a few rows. | Members-only reads and cached population statistics. |
-| `skills/feature_engineer/tools.py` | 67 | `build_entity_features` | Copies the whole event table, all columns, into a temp table. | Copy only the columns the statements use. Not done here because the column list of every later statement has to be derived first; the copy now spills to disk. |
-| `skills/feature_engineer/tools.py` | 565 | `scale_encode` | Three to four full-size frames alive at once. | Do the scaling in DuckDB and write Parquet directly. |
-| `skills/feature_engineer/tools.py` | 647 | `reduce_dimensions` (umap) | UMAP on every row, single-threaded. | Fit on a seeded sample and transform the rest, or refuse above a cap. |
-| `skills/feature_engineer/tools.py` | 406 | `build_graph` | Uncapped edges into pandas and networkx; Python loop over all entities. | Degrees in DuckDB; sparse components; an edge cap. |
-| `skills/feature_engineer/models.py` | 113 | `_open_events` | Same full copy of the events, on every model tool call. | Project the columns; conformity rules reference columns chosen by the agent, so they must be parsed first. The copy now spills to disk. |
-| `skills/feature_engineer/models.py` | 543 | `build_conformity_features` | Full-width `SELECT DISTINCT *` self-join. | Deduplicate the key and the referenced columns only. |
-| `skills/feature_engineer/models.py` | 267 | `build_linked_event_features` | `SELECT DISTINCT` over all rows; the sibling join is quadratic per referenced row. | Deduplicate on the id; collapse siblings to (id, type) before joining. |
-| `skills/feature_engineer/models.py` | 430 | `build_sequence_features` | Three window functions over all events, materialised beside the copy. | Project the needed columns. Now spills to disk. |
-| `skills/feature_engineer/models.py` | 667 | `build_interaction_graph` | Every entity pair fetched as Python tuples, then networkx. | Partner counts in DuckDB; sparse components; an edge cap. |
-| `skills/preparer/tools.py` | 207 | `_apply` (dedupe, log) | Full-width `DISTINCT *` or window for dedupe; `EXCEPT ALL` and one log row per affected source row. | Dedupe only repeated hashes or keys; derive removed rows from the operation's own predicate; aggregate the log. These now spill to disk. |
-| `skills/profiler/tools.py` | 1331 | `correlation_summary` | Up to 105 exact `count(DISTINCT (a, b))` and 435 `corr()` aggregates in one statement. | Test dependencies with a grouped `min = max` check; compute correlations on a seeded sample. Deferred: the columns are capped (15 categories of at most 5,000 values, 30 measures), and it ran in 4.8 s under 600 MB on the test dataset. |
+| Operation | Before | After |
+| --- | --- | --- |
+| Effect sizes of one group (`describe_group`, each finding of `consolidate_findings`) | 108 s, 4.1 GB (both tables loaded; the machine was swapping) | 10 s and 0.95 GB for the first group, 0.6 s for the next ones |
+| Signature of one group (`match_pattern_registry`, `register_pattern`) | 101 s, 4.6 GB | 2 s, 0.55 GB |
+| HBOS scores | 136 s, 3.4 GB | 33 s, 2.1 GB |
+| ECOD scores | no result after 15 minutes (out of memory, swapping) | 143 s, 2.7 GB |
+| `scale_encode` | 51 s, 3.7 GB | 34 s, 1.8 GB |
+
+The matrix itself is 0.96 GB: the detectors now peak at two to three times the matrix, and
+reading a group costs about one row group whatever the size of the table.
+
+### High-risk findings fixed in the second pass
+
+| File | Function | Problem | Fix applied |
+| --- | --- | --- | --- |
+| `skills/_shared/findings.py` | `feature_tables` and its 11 call sites | Raw and scaled tables loaded in full for a few rows or columns. | `feature_source`, `read_features`, `read_numeric_matrix`: only the needed columns, and only the members, read one Parquet row group at a time. No tool calls `feature_tables` any more. |
+| `skills/_shared/findings.py` | `effect_sizes` | Population copied and its medians recomputed for every finding. | `group_effect_sizes`: above `detection.exact_population_max_rows` the population statistics are computed once per table, a few columns at a time, and reused; only the group is read. Below it, unchanged. |
+| `skills/_shared/findings.py` | `signature` | Both tables loaded for one centroid. | `group_signature` reads the members only. |
+| `skills/_shared/artifacts.py` | `save_dataframe` | Tables written as one row group, so a filtered read decoded the whole table. | Row groups of 100,000 rows. |
+| `skills/_shared/detection.py` | `outlier_scores` (ecod, hbos) | Several full-size matrices inside the libraries. | Run a few columns at a time above 20M cells (both add per-column scores; same result). |
+| `skills/_shared/detection.py` | `outlier_scores` (lof) | Every row compared with a 50,000-row sample. | The sample shrinks so that rows x sample stays under 25 billion pairs. |
+| `skills/_shared/detection.py` | `outlier_scores` (autoencoder) | Trained on every row. | Above `detection.fit_max_rows`: trained on a seeded sample, scored in batches. |
+| `skills/_shared/detection.py` | `context_defining_features`, `contextual_scores` | Six to seven full-size temporary matrices. | Computed one column at a time; only the chosen features are transformed. |
+| `skills/_shared/detection.py` | `grouped_series_anomalies` | One frame per group built in a Python loop. | The grid is built in one vectorised step (`_life_grid`). The number of series points was already capped at 3M. |
+| `skills/detector/tools.py` | `_load_matrix`, `run_outlier_detector`, `run_contextual_outliers` | Full tables read, then three copies made. | Only the numeric columns (of the requested families) are read, straight into one array. |
+| `skills/detector/tools.py` | `run_graph_analysis` | Every edge into networkx. | Components on a sparse matrix (`component_table`); communities and centrality refuse graphs above `detection.graph_max_edges`. |
+| `skills/detector/tools.py` | `consolidate_findings` | Both feature tables held; uncapped pairwise merge. | Only the pooled entities' rows are read; the `detection.max_candidates_per_run` largest groups of each run are merged, with a warning. |
+| `skills/critico/tools.py` | `_redetect`, `stability_check` | Matrices re-read in every repetition; the same re-detection recomputed for every finding. | Matrices loaded once per check; what a run finds on a subsample is cached and reused by every finding of the run. |
+| `skills/critico/tools.py` | `artifact_check` | 50 to 90 scans of the source per finding; feature tables loaded twice; cleaning logs loaded whole. | The finding's rows are materialised once; one statement for all columns; the dataset-wide facts are computed once per run; null shares come from the Parquet metadata; logs are counted in DuckDB. |
+| `skills/critico/tools.py` | `_rule_on_windows`, `_rule_relation`, `_attribution` | Full-width `SELECT DISTINCT *` self-join, repeated per rule and key. | The referred rows keep only the columns the rule reads; the rows off a rule are materialised once. |
+| `skills/critico/tools.py` | `inject_synthetic_anomalies` | Every method refitted on all rows plus a full copy. | Above `detection.fit_max_rows` the planted rows are judged against a seeded sample. |
+| `skills/critico/tools.py` | `explain_by_reference`, `match_pattern_registry` | Both feature tables loaded. | Column-only and members-only reads. |
+| `skills/analista/tools.py` | `fit_surrogate_rules` | Uncapped one-hot encoding and two trees on every row. | Above `detection.surrogate_max_rows` non-members: fitted on the members and a seeded sample, precision scaled back to the population; attributes with more than 100 values are not encoded. |
+| `skills/analista/tools.py` | `describe_group`, `get_exemplars`, `make_plot`, `register_pattern` | Both feature tables loaded; a figure leaked if drawing failed. | Members-only and column-only reads; the embedding plot is thinned; figures are always closed. |
+| `skills/feature_engineer/tools.py` | `build_entity_features` | Whole event table copied. | Only the columns the aggregations read are copied. |
+| `skills/feature_engineer/tools.py` | `scale_encode` | Three to four full-size frames. | Scaled one column at a time from blocks of columns read from the file; written without assembling a frame. |
+| `skills/feature_engineer/tools.py` | `reduce_dimensions` (umap) | UMAP on every row. | Above `detection.fit_max_rows`: fitted on a seeded sample, the rest projected in batches. |
+| `skills/feature_engineer/tools.py` | `build_graph` | networkx and a Python loop over all entities. | Degrees, weighted degrees, components and clustering on sparse matrices (same values); refuses more than 50M edges. |
+| `skills/feature_engineer/models.py` | `_open_events` and the four model tools | Whole event table copied on every call. | Only the columns each tool reads (for conformity rules: the columns named in the expressions). |
+| `skills/feature_engineer/models.py` | `build_conformity_features` | Full-width `SELECT DISTINCT *` self-join. | Follows from the projection: the referred rows hold only the rule's columns. |
+| `skills/feature_engineer/models.py` | `build_linked_event_features` | Sibling join quadratic per referenced row. | Siblings reduced to (referenced row, type) first; the per-entity count uses `EXISTS`. |
+| `skills/feature_engineer/models.py` | `build_interaction_graph` | Every pair as Python tuples, networkx, Python loop. | Partner counts in DuckDB, components on a sparse matrix; refuses more than 50M pairs. |
+| `skills/preparer/tools.py` | `_apply` (drop rows) | `EXCEPT ALL` between two full copies to log removed rows. | The removed rows are read with the operation's own predicate. |
+| `skills/profiler/tools.py` | `correlation_summary` | Up to 105 exact pair distinct counts in one statement. | Eight pairs per statement. |
+
+**Behaviour changes to know about** (all others give the same output as before):
+
+- Two rows of the referred table with the same key and the same values in the columns a
+  rule reads now count once (they used to count twice when they differed elsewhere).
+- A row with two different types among its own duplicates is no longer excluded from being
+  its own sibling in `build_linked_event_features`.
+- `artifact_check` lists the example files of a scale shift in a fixed (sorted) order.
+
+## High-risk findings still open
+
+| File | Function | Problem | Why it is left |
+| --- | --- | --- | --- |
+| `skills/critico/tools.py` | `stability_check` | Each repetition refits every method on 80% of the entities. It is now done once per run, not once per finding, but it is still `stability_runs` times the cost of detection. | It is what the check measures. Lower `critic.stability_runs`, or the subsample, on very large populations. |
+| `skills/detector/tools.py` | `run_contextual_outliers` (`all_features`) | The z-scores of every feature are kept and saved with the run. | They are the tool's output (consolidation groups on them). The default method keeps a few features only. |
+| `skills/_shared/detection.py` | `outlier_scores` (isolation forest), `cluster_labels` (kmeans, gmm) | Every row is scored; `n_init=10`. | Memory is one matrix; scikit-learn scores in chunks. CPU only. |
+| `skills/feature_engineer/models.py` | `build_linked_event_features`, `build_sequence_features` | A `DISTINCT` and three window functions over all events. | On the projected columns only, and they spill to disk under the DuckDB limit. |
+| `skills/preparer/tools.py` | `_apply` (dedupe) | Full-width `DISTINCT *` or window, and `EXCEPT ALL` for its log. | Removing exact duplicates needs the full row; it spills to disk. |
+| `skills/feature_engineer/models.py`, `tools.py` | `_extend`, `build_graph` | The feature table is rewritten through pandas for every extension. | One copy of the raw feature table per call; bounded, listed below as medium. |
+
+What bounds none of the above: memory outside DuckDB has no cap. The fixes keep the peak
+near one to three copies of the feature matrix, but a population that does not fit in RAM
+as one matrix still needs a larger machine or a filter (`run`'s `--filter`).
 
 ## Medium and low findings (follow-ups)
 
@@ -145,9 +185,7 @@ The 600 MB limit stands in for a dataset about seven times larger under the defa
 | medium | `skills/detector/tools.py` | 314 | `run_timeseries_anomaly` | Three scans; groups not capped. | One aggregate into a temp table; a group cap. |
 | medium | `skills/detector/tools.py` | 167, 556 | `run_clustering`, `consolidate_findings` | Python call per row; whole run tables read. | Vectorise; read only the needed columns. |
 | medium | `skills/critico/tools.py` | 248, 280, 904 | `_rebuild_series`, `ensemble_agreement`, `rerun_on_version` | Series re-aggregated per finding; every run table read per finding; full refits. | Save the series as an artifact; aggregate in DuckDB. |
-| medium | `skills/critico/tools.py` | 379 | `artifact_check` (cleaning logs) | Each cleaning log read whole into pandas. | Aggregate in DuckDB. |
 | low | `skills/critico/tools.py` | 989 | `compare_to_known_labels` | All label ids fetched into a set. | Count the overlap in DuckDB. |
-| medium | `skills/analista/tools.py` | 255 | `make_plot` | Loads both feature tables before branching; a figure leaks if drawing fails. | Load in the branch that needs it; close the figure on failure. |
 | medium | `skills/feature_engineer/tools.py` | 67 | `build_entity_features` | Exact quantiles per measure; one scan per category and counterparty column; unbounded fetch of category levels. | Combined or approximate quantiles; `LIMIT` on the level check. |
 | medium | `skills/feature_engineer/tools.py` | 707, 647 | `feature_summary`, `reduce_dimensions` (pca) | Correlation and PCA on every row. | Seeded sample. |
 | medium | `skills/feature_engineer/models.py` | 82, 160 | `_extend`, `build_category_features` | Full feature table rewritten per extension; self-join to pick 12 pairs. | Join in DuckDB and write Parquet; semi-join first. |
@@ -165,6 +203,7 @@ The 600 MB limit stands in for a dataset about seven times larger under the defa
 
 ## Also noticed
 
-- `tests/test_cli.py::test_generate_data_and_list_datasets` fails when it runs straight after
-  `tests/test_phase6.py` and passes otherwise. It does so on the code before these changes
-  too, so it is a test-order dependency, not a regression. Not fixed here.
+- `tests/test_cli.py::test_generate_data_and_list_datasets` failed when it ran after a test
+  that used the session fixture `phase4_pipeline`. The fixture yielded inside its active
+  run, so that run stayed the current one for the rest of the session and the CLI's
+  `datasets` command listed its data. The fixture now yields outside the run.
