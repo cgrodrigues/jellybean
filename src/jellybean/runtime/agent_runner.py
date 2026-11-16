@@ -30,7 +30,7 @@ from jellybean.runtime.human import AutoApproveHuman, HumanInterface
 from jellybean.runtime.llm_client import LLMClient, Message
 from jellybean.runtime.skill_loader import SkillDefinition, discover_skills
 from jellybean.runtime.tool_registry import ToolRegistry, ToolResult, ToolSpec, get_tool_spec, tool
-from jellybean.runtime.tracing import trace_event
+from jellybean.runtime.tracing import log_exception, safe_error_text, trace_event, trace_tool_call
 
 AgentStatus = Literal["done", "needs_rework", "needs_human", "failed"]
 FINISH_TOOL = "finish"
@@ -215,10 +215,17 @@ class AgentRunner:
     def _execute(self, name: str, arguments: Any) -> ToolResult:
         spec = self.tools.get(name)
         if spec is None:
-            return ToolResult.error(f"Unknown tool '{name}'. Available: {sorted(self.tools)}")
+            return self._rejected(name, {}, f"Unknown tool '{name}'. Available: {sorted(self.tools)}")
         if not isinstance(arguments, dict):
-            return ToolResult.error("Tool arguments must be a JSON object.")
+            return self._rejected(name, {}, "Tool arguments must be a JSON object.")
         return spec.func(**arguments)
+
+    @staticmethod
+    def _rejected(name: str, arguments: dict[str, Any], message: str) -> ToolResult:
+        """Error result for a call that never reached a tool; traced so it is not silent."""
+        result = ToolResult.error(message)
+        trace_tool_call(name, arguments, "error", len(result.to_json()), 0, 0.0, None, False, error=message)
+        return result
 
     def run(self, task: str, artifact_ids: list[str]) -> AgentResult:
         ctx = current_run().for_agent(self.skill.name)
@@ -243,7 +250,12 @@ class AgentRunner:
             output_tokens=tokens[1],
             **extra,
         )
-        trace_event("agent_end", status=status, iterations=iterations, input_tokens=tokens[0], output_tokens=tokens[1])
+        # A failure always says why (shown in the console): runtime reasons are short codes
+        # and messages, never data.
+        why = {"reason": safe_error_text(summary), "issues": result.issues} if status == "failed" else {}
+        trace_event(
+            "agent_end", status=status, iterations=iterations, input_tokens=tokens[0], output_tokens=tokens[1], **why
+        )
         return result
 
     def _loop(self, task: str, artifact_ids: list[str]) -> AgentResult:
@@ -269,7 +281,8 @@ class AgentRunner:
             try:
                 response = self.runtime.llm.complete(self.skill.name, system, messages, specs)
             except Exception as exc:
-                trace_event("llm_error", error=f"{type(exc).__name__}: {exc}"[:500])
+                log_exception("llm_call", exc)
+                trace_event("llm_error", error=safe_error_text(f"{type(exc).__name__}: {exc}"))
                 return self._result(
                     "failed",
                     f"LLM call failed: {type(exc).__name__}: {exc}"[:500],
@@ -323,7 +336,7 @@ class AgentRunner:
                     args = FINISH_SPEC.params_model.model_validate(finish_args)
                 except ValidationError as exc:
                     # Replace the optimistic acknowledgement with the validation error.
-                    error = ToolResult.error(f"Invalid finish arguments: {exc}").to_json()
+                    error = self._rejected(FINISH_TOOL, {}, f"Invalid finish arguments: {exc}").to_json()
                     messages[finish_index] = Message(
                         role="tool", content=error, tool_call_id=messages[finish_index].tool_call_id, name=FINISH_TOOL
                     )

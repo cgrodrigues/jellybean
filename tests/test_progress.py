@@ -48,6 +48,7 @@ EVENTS = [
         "arguments": {"left": "a", "right": "b"},
         "status": "error",
         "duration_s": 0.1,
+        "error": "Binder Error: column b.key not found",
     },
     {"kind": "tool_call", "agent": "profiler", "tool": "finish", "arguments": {}, "status": "ok", "duration_s": 0},
     {"kind": "agent_end", "agent": "profiler", "status": "done", "iterations": 6},
@@ -63,6 +64,7 @@ def test_progress_lines() -> None:
     assert "▶ profiler: Profile the datasets in the spec" in text
     assert "  · profile_table(dataset=traffic)  1.5s" in text  # indented under its agent
     assert "test_join(left=a, right=b)  0.1s  ✖ error" in text
+    assert "    ↳ Binder Error: column b.key not found" in text  # message under the failed call
     assert "finish(" not in text  # internal calls are hidden
     assert "✔ profiler done — 6 turns, 9k tokens (65% cached)" in text
     assert "◆ cleaning_approval → Approve recommended plan (auto)" in text
@@ -131,3 +133,34 @@ def test_outputs_listed_at_agent_end() -> None:
     assert "- plot_f001_embedding_v1 (plot)" in text
     assert "profile_x_v1" not in text and "+ 1 document(s)" in text  # documents summarised
     assert "profile_x_v1" in "\n".join(_render(events, verbose=True))  # listed in verbose mode
+
+
+def test_failures_are_never_silent() -> None:
+    lines = _render(
+        [
+            {"kind": "agent_start", "agent": "orquestrador", "task": "t"},
+            # delegate is normally hidden, but not when it fails
+            {
+                "kind": "tool_call",
+                "tool": "delegate",
+                "arguments": {"agent": "profiler"},
+                "status": "error",
+                "duration_s": 0.2,
+                "error": "KeyError: 'spec'",
+            },
+            {"kind": "tool_call", "tool": "run_sql", "arguments": {}, "status": "error", "duration_s": 0.1},
+            {"kind": "llm_error", "error": "ConnectionError: network down"},
+            {
+                "kind": "agent_end",
+                "agent": "orquestrador",
+                "status": "failed",
+                "iterations": 1,
+                "reason": "LLM call failed: ConnectionError: network down",
+            },
+        ]
+    )
+    text = "\n".join(lines)
+    assert "delegate(agent=profiler)  0.2s  ✖ error" in text and "↳ KeyError: 'spec'" in text
+    assert "↳ no error message recorded" in text
+    assert "✖ LLM error: ConnectionError: network down" in text
+    assert "✖ orquestrador failed" in text and "↳ LLM call failed: ConnectionError: network down" in text

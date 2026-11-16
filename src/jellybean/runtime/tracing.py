@@ -1,8 +1,14 @@
 """Append-only JSONL tracing (``workspace/<run_id>/logs/trace.jsonl``).
 
 One line per LLM call (tokens, duration) and per tool call (arguments, output
-size, raw rows returned, duration, artifact created). Data values are never
+size, raw rows returned, duration, artifact created). Tool outputs are never
 written here, only arguments and sizes (privacy requirement, section 11).
+
+Error messages are recorded: a failed tool call carries a short ``error`` text
+(cut to ``_MAX_ARG_CHARS``, with values that look like personal data masked), so
+the person running the CLI can see why it failed. An exception message can quote
+a data value (e.g. a failed cast), which is why it is cut and masked. Full
+tracebacks of unexpected exceptions go to ``logs/errors.log``, never to the trace.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +37,33 @@ def _compact(value: Any) -> Any:
     if len(text) > _MAX_ARG_CHARS:
         return text[:_MAX_ARG_CHARS] + "...<cut>"
     return value
+
+
+def safe_error_text(message: Any) -> str:
+    """Error text fit for the trace and the console: one line, masked, cut."""
+    text = " ".join(str(message).split())
+    ctx = maybe_current_run()
+    if ctx is not None:
+        from jellybean.skills._shared.masking import Masker
+
+        text = Masker(ctx.settings.config.masking, salt=ctx.run_id).mask_text(text)
+    return text if len(text) <= _MAX_ARG_CHARS else text[:_MAX_ARG_CHARS] + "...<cut>"
+
+
+def log_exception(where: str, exc: BaseException) -> None:
+    """Append the full traceback of an unexpected exception to ``logs/errors.log``.
+
+    A no-op outside a run. The file stays in the run workspace (never sent to the LLM).
+    """
+    ctx = maybe_current_run()
+    if ctx is None:
+        return
+    stamp = datetime.now(UTC).isoformat(timespec="milliseconds")
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    with _LOCK, contextlib.suppress(OSError):
+        ctx.logs_dir.mkdir(parents=True, exist_ok=True)
+        with ctx.errors_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{stamp}] agent={ctx.agent} {where}\n{text}\n")
 
 
 # Callables notified of every event (e.g. the console progress view of the CLI).
@@ -76,8 +110,13 @@ def trace_tool_call(
     duration_s: float,
     artifact_id: str | None,
     truncated: bool,
+    error: str | None = None,
 ) -> None:
-    """Record a tool call. ``arguments`` are compacted, never the output."""
+    """Record a tool call. ``arguments`` are compacted, never the output.
+
+    ``error`` is the message of a failed call; it is masked and cut before writing.
+    """
+    extra = {"error": safe_error_text(error)} if error else {}
     trace_event(
         "tool_call",
         tool=tool,
@@ -88,4 +127,5 @@ def trace_tool_call(
         duration_s=round(duration_s, 4),
         artifact_id=artifact_id,
         truncated=truncated,
+        **extra,
     )

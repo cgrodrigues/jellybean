@@ -71,6 +71,10 @@ class RunContext:
     def trace_path(self) -> Path:
         return self.logs_dir / "trace.jsonl"
 
+    @property
+    def errors_path(self) -> Path:
+        return self.logs_dir / "errors.log"
+
     def for_agent(self, agent: str) -> RunContext:
         """Return a copy of this context attributed to another agent."""
         return replace(self, agent=agent)

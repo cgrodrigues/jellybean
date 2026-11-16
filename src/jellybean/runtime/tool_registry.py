@@ -40,7 +40,7 @@ from typing import Any, Literal, get_type_hints
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 from jellybean.runtime.context import maybe_current_run
-from jellybean.runtime.tracing import trace_tool_call
+from jellybean.runtime.tracing import log_exception, trace_tool_call
 from jellybean.settings import get_settings
 
 # Raw data rows must always be returned under this summary key, so the
@@ -386,6 +386,14 @@ def _run_with_timeout(fn: Callable[..., Any], kwargs: dict[str, Any], timeout_s:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _error_message(result: ToolResult) -> str | None:
+    """Message of an error result (for the trace), ``None`` for a successful one."""
+    if result.status != "error":
+        return None
+    summary = result.summary
+    return str(summary.get("error") or summary.get("_truncated_preview") or "error without a message")
+
+
 def tool(
     fn: Callable[..., Any] | None = None,
     *,
@@ -452,6 +460,9 @@ def tool(
             except TimeoutError:
                 result = ToolResult.error(f"Tool '{tool_name}' timed out after {limit_time:g}s")
             except Exception as exc:
+                # Unexpected: the message goes to the agent, the trace and the console;
+                # the full traceback to logs/errors.log.
+                log_exception(f"tool={tool_name}", exc)
                 result = ToolResult.error(f"{type(exc).__name__}: {exc}")
 
             result = enforce_limits(result, limit_chars, limit_rows)
@@ -464,6 +475,7 @@ def tool(
                 duration_s=time.perf_counter() - started,
                 artifact_id=result.artifact_id,
                 truncated=result.truncated,
+                error=_error_message(result),
             )
             return result
 

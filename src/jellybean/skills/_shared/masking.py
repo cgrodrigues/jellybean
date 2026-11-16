@@ -16,6 +16,9 @@ from typing import Any
 
 from jellybean.settings import MaskingConfig
 
+# A token of a free text: anything between whitespace and quotes.
+_TOKEN_RE = re.compile(r"[^\s'\"`]+")
+
 
 class Masker:
     """Detect and mask personal-data columns."""
@@ -42,6 +45,18 @@ class Masker:
             return None
         digest = hashlib.sha256(f"{self.salt}|{value}".encode()).hexdigest()[:10]
         return f"masked:{digest}"
+
+    def mask_text(self, text: str) -> str:
+        """Mask the tokens of a free text (e.g. an error message) that look like personal data."""
+
+        def repl(match: re.Match[str]) -> str:
+            token = match.group(0)
+            core = token.strip(".,;:()[]{}<>")
+            if core and any(r.match(core) for r in self._value_res):
+                return token.replace(core, self.mask_value(core))
+            return token
+
+        return _TOKEN_RE.sub(repl, text)
 
     def mask_rows(self, columns: list[str], rows: list[list[Any]]) -> tuple[list[list[Any]], list[str]]:
         """Mask sensitive columns in a list of rows.

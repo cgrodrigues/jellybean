@@ -154,3 +154,62 @@ def test_shortened_lists_are_named_in_a_warning() -> None:
     result = enforce_limits(ToolResult.ok({"datasets": [{"name": f"d{i}" * 40} for i in range(200)]}), 4000, 20)
     assert result.truncated and len(result.to_json()) <= 4000
     assert any("datasets" in w and "of 200" in w and "do not treat them as complete" in w for w in result.warnings)
+
+
+# ------------------------------------------------------------------ error visibility
+def _trace(ctx: RunContext) -> list[dict]:
+    return [json.loads(line) for line in ctx.trace_path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_raising_tool_records_its_error_in_the_trace(run_ctx: RunContext) -> None:
+    assert boom().status == "error"
+    event = _trace(run_ctx)[-1]
+    assert event["tool"] == "boom" and event["status"] == "error"
+    assert event["error"] == "RuntimeError: kaboom"
+    # The traceback goes to errors.log, never to the trace.
+    log = run_ctx.errors_path.read_text(encoding="utf-8")
+    assert "Traceback" in log and "kaboom" in log and "tool=boom" in log
+    assert "Traceback" not in run_ctx.trace_path.read_text(encoding="utf-8")
+
+
+def test_error_results_are_traced_and_successes_carry_no_error(run_ctx: RunContext) -> None:
+    @tool
+    def refuse() -> ToolResult:
+        """Returns an error result without raising."""
+        return ToolResult.error("nothing to do here")
+
+    refuse()
+    add(1)
+    events = _trace(run_ctx)
+    assert events[-2]["error"] == "nothing to do here"
+    assert "error" not in events[-1]
+    assert not run_ctx.errors_path.exists()  # no traceback for an expected error
+
+
+def test_traced_error_is_cut_and_masked(run_ctx: RunContext) -> None:
+    @tool
+    def leak() -> ToolResult:
+        """Fails with a message quoting a personal value."""
+        raise ValueError("Could not convert string '+351912345678' to INT32 " + "x" * 2000)
+
+    leak()
+    error = _trace(run_ctx)[-1]["error"]
+    assert "+351912345678" not in error and "masked:" in error
+    assert len(error) < 600 and error.endswith("...<cut>")
+
+
+def test_console_prints_the_error_of_a_raising_tool(run_ctx: RunContext) -> None:
+    import re
+
+    from jellybean.runtime.progress import ConsoleProgress
+    from jellybean.runtime.tracing import add_listener, remove_listener
+
+    lines: list[str] = []
+    view = ConsoleProgress(echo=lambda line: lines.append(re.sub(r"\x1b\[[0-9;]*m", "", line)))
+    add_listener(view)
+    try:
+        boom()
+    finally:
+        remove_listener(view)
+    assert any("boom()" in line and "✖ error" in line for line in lines)
+    assert any("↳ RuntimeError: kaboom" in line for line in lines)  # normal mode, not only --verbose

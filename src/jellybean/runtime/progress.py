@@ -12,7 +12,9 @@ happens:
     [00:41]     - profile_traffic_v1 (json)  /…/workspace/<run_id>/artifacts/profile_traffic_v1.json
     [00:42] ◆ control_1:join[0] → confirmed ... (auto)
 
-It only prints what the trace already records (arguments and sizes, never data).
+It only prints what the trace already records (arguments, sizes and the message
+of a failed call, never tool outputs). Failures are always shown with their
+message, also without ``--verbose``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ import typer
 
 # Tools whose call is already shown by another line (a delegated agent's start/end).
 _HIDDEN_TOOLS = {"delegate", "finish"}
+# Longest error message printed on one line.
+_MAX_ERROR_CHARS = 400
 _STATUS_ICON = {
     "done": ("✔", typer.colors.GREEN),
     "needs_rework": ("↺", typer.colors.YELLOW),
@@ -127,7 +131,8 @@ class ConsoleProgress:
 
     def _on_tool_call(self, event: dict[str, Any]) -> None:
         tool = event.get("tool")
-        if tool in _HIDDEN_TOOLS:
+        failed = event.get("status") == "error"
+        if tool in _HIDDEN_TOOLS and not failed:
             return
         args = event.get("arguments") or {}
         shown = list(args.items()) if self.verbose else list(args.items())[:2]
@@ -135,8 +140,10 @@ class ConsoleProgress:
         text += f"  {event.get('duration_s', 0):.1f}s"
         if event.get("artifact_id") and self.verbose:
             text += f" → {event['artifact_id']}"
-        if event.get("status") == "error":
+        if failed:
             self._line(text + "  ✖ error", typer.colors.RED)
+            message = event.get("error") or "no error message recorded"
+            self._line(f"  ↳ {_short(message, _MAX_ERROR_CHARS)}", typer.colors.RED)
         else:
             self._line(text)
 
@@ -160,6 +167,9 @@ class ConsoleProgress:
             f"{_tokens(tokens)} tokens{share}, {time.monotonic() - start:.1f}s",
             color,
         )
+        if event.get("status") == "failed":
+            reason = event.get("reason") or ", ".join(event.get("issues") or []) or "no reason recorded"
+            self._line(f"  ↳ {_short(reason, _MAX_ERROR_CHARS)}", typer.colors.RED)
         outputs = self._outputs.pop() if self._outputs else []
         # Datasets (tables) and plots are listed; documents are summarised unless verbose.
         listed = [o for o in outputs if self.verbose or o.get("type") in ("table", "plot")]
@@ -180,4 +190,4 @@ class ConsoleProgress:
                 )
 
     def _on_llm_error(self, event: dict[str, Any]) -> None:
-        self._line(f"✖ LLM error: {_short(event.get('error'), 120)}", typer.colors.RED)
+        self._line(f"✖ LLM error: {_short(event.get('error'), _MAX_ERROR_CHARS)}", typer.colors.RED)

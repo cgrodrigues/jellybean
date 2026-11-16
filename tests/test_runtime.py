@@ -151,6 +151,24 @@ def test_llm_errors_fail_the_agent_not_the_process(run_ctx: RunContext) -> None:
 
     result = _runtime(run_ctx, {"profiler": [explode]}).run_agent("profiler", "t")
     assert result.status == "failed" and "network down" in result.summary
+    events = [json.loads(line) for line in run_ctx.trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(e["kind"] == "llm_error" and "network down" in e["error"] for e in events)
+    assert events[-1]["kind"] == "agent_end" and "network down" in events[-1]["reason"]
+    assert "ConnectionError" in run_ctx.errors_path.read_text(encoding="utf-8")
+
+
+def test_unknown_tool_and_delegate_failures_are_traced(run_ctx: RunContext) -> None:
+    script = {
+        "orquestrador": [
+            call("no_such_tool"),
+            call("delegate", agent="ghost", task="x"),
+            call("finish", status="done", summary="ok"),
+        ]
+    }
+    _runtime(run_ctx, script).run_agent("orquestrador", "t")
+    events = [json.loads(line) for line in run_ctx.trace_path.read_text(encoding="utf-8").splitlines()]
+    errors = {e["tool"]: e["error"] for e in events if e["kind"] == "tool_call" and e["status"] == "error"}
+    assert "Unknown tool" in errors["no_such_tool"] and "Unknown agent" in errors["delegate"]
 
 
 # ----------------------------------------------------------------- delegation/isolation
