@@ -140,6 +140,15 @@ class DetectionConfig(_Section):
     cluster_max_rows: int = Field(200_000, ge=1000)  # HDBSCAN is fitted on a seeded sample above this
     group_max_pool: int = Field(10_000, ge=100)  # pooled outliers grouped by pairwise distance (n^2 memory)
     plot_max_points: int = Field(50_000, ge=1000)  # population points drawn in a scatter plot
+    # Above this many entities: outlier models are fitted on a seeded sample and score
+    # the rest in batches; contextual features are chosen on a sample.
+    fit_max_rows: int = Field(500_000, ge=1000)
+    # Above this many entities a group is compared with the statistics of the whole
+    # population (computed once), not with the population outside the group.
+    exact_population_max_rows: int = Field(500_000, ge=0)
+    surrogate_max_rows: int = Field(200_000, ge=1000)  # non-members used to fit surrogate rules
+    max_candidates_per_run: int = Field(500, ge=10)  # largest groups of a detection run kept for merging
+    graph_max_edges: int = Field(2_000_000, ge=1000)  # community detection and centrality refuse more edges
 
 
 class CriticConfig(_Section):

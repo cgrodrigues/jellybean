@@ -12,6 +12,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from jellybean.runtime.cancellation import check_cancelled
+
 OUTLIER_METHODS = ("isolation_forest", "lof", "ecod", "hbos", "autoencoder")
 CLUSTER_METHODS = ("hdbscan", "gmm", "kmeans")
 
@@ -20,8 +22,42 @@ class DetectionError(ValueError):
     """Invalid method/parameters or missing optional dependency."""
 
 
-def outlier_scores(X: np.ndarray, method: str, params: dict[str, Any], seed: int, lof_max_rows: int) -> np.ndarray:
-    """Outlier score per row (higher = more anomalous)."""
+# ECOD and HBOS score each column on its own and add the columns up: above this many
+# cells they are run a few columns at a time (same scores, a fraction of the memory).
+_COLUMNWISE_CELLS = 20_000_000
+# LOF compares every row with the fitted sample: the sample shrinks so that
+# rows x sample stays below this many pairs (never below _LOF_MIN_SAMPLE rows).
+_LOF_MAX_PAIRS = 25_000_000_000
+_LOF_MIN_SAMPLE = 5_000
+_SCORE_BATCH = 100_000
+
+
+def _by_columns(fit_scores: Any, X: np.ndarray) -> np.ndarray:
+    """Sum of ``fit_scores`` over blocks of columns (for detectors that add per-column scores)."""
+    if X.size <= _COLUMNWISE_CELLS or X.shape[1] < 2:
+        return fit_scores(X)
+    width = max(1, _COLUMNWISE_CELLS // len(X))
+    total = np.zeros(len(X))
+    for start in range(0, X.shape[1], width):
+        check_cancelled()
+        total += fit_scores(np.ascontiguousarray(X[:, start : start + width]))
+    return total
+
+
+def outlier_scores(
+    X: np.ndarray,
+    method: str,
+    params: dict[str, Any],
+    seed: int,
+    lof_max_rows: int,
+    fit_max_rows: int | None = None,
+) -> np.ndarray:
+    """Outlier score per row (higher = more anomalous).
+
+    Memory stays bounded on large populations: ECOD and HBOS run a few columns
+    at a time (same scores), LOF fits on a sample, and above ``fit_max_rows``
+    the autoencoder is trained on a seeded sample and scores the rest in batches.
+    """
     params = dict(params)
     if method == "isolation_forest":
         from sklearn.ensemble import IsolationForest
@@ -36,7 +72,8 @@ def outlier_scores(X: np.ndarray, method: str, params: dict[str, Any], seed: int
         if len(X) > lof_max_rows:
             # Quadratic method: fit on a sample, score everything (novelty mode).
             rng = np.random.default_rng(seed)
-            sample = X[rng.choice(len(X), lof_max_rows, replace=False)]
+            size = min(lof_max_rows, max(_LOF_MIN_SAMPLE, _LOF_MAX_PAIRS // len(X)))
+            sample = X[rng.choice(len(X), size, replace=False)]
             model = LocalOutlierFactor(n_neighbors=k, novelty=True).fit(sample)
             return -model.score_samples(X)
         model = LocalOutlierFactor(n_neighbors=k)
@@ -51,11 +88,12 @@ def outlier_scores(X: np.ndarray, method: str, params: dict[str, Any], seed: int
             # Near-constant columns make scipy's skewness warn about precision;
             # pyod already replaces the resulting NaNs, so the warning is noise.
             warnings.simplefilter("ignore", RuntimeWarning)
-            return ECOD().fit(X).decision_scores_
+            return _by_columns(lambda block: ECOD().fit(block).decision_scores_, X)
     if method == "hbos":
         from pyod.models.hbos import HBOS
 
-        return HBOS(n_bins=int(params.get("n_bins", 20))).fit(X).decision_scores_
+        n_bins = int(params.get("n_bins", 20))
+        return _by_columns(lambda block: HBOS(n_bins=n_bins).fit(block).decision_scores_, X)
     if method == "autoencoder":
         try:
             from pyod.models.auto_encoder import AutoEncoder
@@ -65,7 +103,15 @@ def outlier_scores(X: np.ndarray, method: str, params: dict[str, Any], seed: int
             model = AutoEncoder(epoch_num=int(params.get("epochs", 20)), random_state=seed, verbose=0)
         except TypeError:  # pragma: no cover - older/newer pyod signatures
             model = AutoEncoder(random_state=seed)
-        return model.fit(X).decision_scores_
+        if fit_max_rows is None or len(X) <= fit_max_rows:
+            return model.fit(X).decision_scores_
+        chosen = np.sort(np.random.default_rng(seed).choice(len(X), fit_max_rows, replace=False))
+        model.fit(X[chosen])
+        scores = np.empty(len(X))
+        for start in range(0, len(X), _SCORE_BATCH):
+            check_cancelled()
+            scores[start : start + _SCORE_BATCH] = model.decision_function(X[start : start + _SCORE_BATCH])
+        return scores
     raise DetectionError(f"Unknown outlier method '{method}'. Use one of {OUTLIER_METHODS}.")
 
 
@@ -135,6 +181,40 @@ def cluster_labels(
     raise DetectionError(f"Unknown clustering method '{method}'. Use one of {CLUSTER_METHODS}.")
 
 
+def _varying_numeric(raw: pd.DataFrame, entity: str) -> list[str]:
+    """Numeric feature columns with more than one value."""
+    columns = raw.drop(columns=[entity]).select_dtypes(include=["number"]).columns
+    return [c for c in columns if raw[c].nunique() > 1]
+
+
+def component_table(edges: pd.DataFrame, entity: str, tie: str = "value") -> pd.DataFrame:
+    """(entity, group, group_size) of the connected components of an edge list (columns ``src``, ``dst``).
+
+    Uses a sparse matrix of integer codes, so millions of edges are fine. Groups
+    are numbered from 1 by decreasing size; ties are broken by the smallest
+    member (``tie="value"``) or by the smallest member as text (``tie="text"``).
+    Rows are ordered by group, then by entity.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    edges = edges.dropna(subset=["src", "dst"])
+    codes, nodes = pd.factorize(pd.concat([edges["src"], edges["dst"]], ignore_index=True))
+    if not len(nodes):
+        return pd.DataFrame({entity: [], "group": pd.Series(dtype=int), "group_size": pd.Series(dtype=int)})
+    src, dst = codes[: len(edges)], codes[len(edges) :]
+    adjacency = coo_matrix((np.ones(len(edges), dtype=np.int8), (src, dst)), shape=(len(nodes), len(nodes)))
+    _, labels = connected_components(adjacency, directed=False)
+    table = pd.DataFrame({entity: np.asarray(nodes), "label": labels})
+    sizes = table.groupby("label").size()
+    first = (table[entity].astype(str) if tie == "text" else table[entity]).groupby(table["label"]).min()
+    order = sorted(sizes.index, key=lambda lab: (-sizes.at[lab], str(first.at[lab])))
+    rank = pd.Series(np.arange(1, len(order) + 1), index=order)
+    table["group"] = table["label"].map(rank).astype(int)
+    table["group_size"] = table["label"].map(sizes).astype(int)
+    return table.sort_values(["group", entity]).drop(columns="label").reset_index(drop=True)
+
+
 def context_defining_features(raw: pd.DataFrame, entity: str, context: str, n_features: int) -> list[str]:
     """Numeric features that differ most **between** context groups (eta squared on ranks).
 
@@ -144,21 +224,26 @@ def context_defining_features(raw: pd.DataFrame, entity: str, context: str, n_fe
     correlation| > 0.9 within the context groups, with a feature already chosen)
     are skipped.
     """
-    numeric = raw.drop(columns=[entity]).select_dtypes(include=["number"]).astype(float)
-    numeric = numeric.loc[:, numeric.nunique() > 1]
+    numeric = _varying_numeric(raw, entity)
     groups = raw[context].astype("string").fillna("__missing__")
-    ranks = numeric.rank(pct=True)
-    centred = ranks - ranks.mean()
-    between = (ranks.groupby(groups).transform("mean") - ranks.mean()) ** 2
-    eta = between.sum() / (centred**2).sum().replace(0, np.nan)
-    ranked = eta.dropna().sort_values(ascending=False).index.tolist()
+    # One column at a time: the ranks of every feature at once would be several
+    # copies of the whole table.
+    eta = {}
+    for col in numeric:
+        ranks = raw[col].astype(float).rank(pct=True)
+        mean = ranks.mean()
+        within_total = ((ranks - mean) ** 2).sum()
+        if within_total == 0:
+            continue
+        eta[col] = ((ranks.groupby(groups).transform("mean") - mean) ** 2).sum() / within_total
+    ranked = pd.Series(eta, dtype=float).dropna().sort_values(ascending=False).index.tolist()
     # Prefer diverse features: skip one that is almost a copy (|rank corr| > 0.9)
     # of a feature already chosen (e.g. mean / median / p95 of the same measure).
     # Redundancy is measured WITHIN context groups: features that only move
     # together because they differ between groups (e.g. consumption and rated
     # power across models) are not copies inside a group, where outliers live.
     top = ranked[: 4 * n_features]
-    within = numeric[top].groupby(groups).rank(pct=True)
+    within = raw[top].astype(float).groupby(groups).rank(pct=True)
     corr = within.corr().abs()
     chosen: list[str] = []
     for feature in ranked:
@@ -191,13 +276,13 @@ def contextual_scores(
     Returns:
         The scores and the per-entity z-scores used (columns = features).
     """
-    numeric = raw.drop(columns=[entity]).select_dtypes(include=["number"]).astype(float)
-    numeric = numeric.loc[:, numeric.nunique() > 1]
     if method == "context_defining":
-        numeric = numeric[context_defining_features(raw, entity, context, n_features)]
-    elif method != "all_features":
+        columns = context_defining_features(raw, entity, context, n_features)
+    elif method == "all_features":
+        columns = _varying_numeric(raw, entity)
+    else:
         raise DetectionError(f"Unknown contextual method '{method}'. Use context_defining or all_features.")
-    transformed = numeric.apply(lambda c: np.log1p(c) if c.min() >= 0 else c)
+    transformed = raw[columns].astype(float).apply(lambda c: np.log1p(c) if c.min() >= 0 else c)
     groups = raw[context].astype("string").fillna("__missing__")
     z = pd.DataFrame(index=raw.index, columns=transformed.columns, dtype=float)
     for _, idx in groups.groupby(groups).groups.items():
@@ -327,6 +412,16 @@ def seasonal_residual_anomalies(
     return df[df["z"] >= threshold].drop(columns=["resid"])
 
 
+def _life_grid(active: pd.DataFrame, step: pd.Timedelta) -> pd.DataFrame:
+    """(group, ts) for every bucket between each group's first (``min``) and last (``max``) active bucket."""
+    counts = ((active["max"] - active["min"]) // step + 1).to_numpy().astype(np.int64)
+    first = np.repeat(np.cumsum(counts) - counts, counts)
+    offsets = np.arange(int(counts.sum()), dtype=np.int64) - first
+    starts = pd.DatetimeIndex(active["min"]).repeat(counts)
+    ts = (starts + pd.to_timedelta(offsets * step.value)).astype(active["min"].dtype)
+    return pd.DataFrame({"group": active.index.repeat(counts), "ts": ts})
+
+
 def grouped_series_anomalies(
     series: pd.DataFrame,
     step: pd.Timedelta,
@@ -360,11 +455,7 @@ def grouped_series_anomalies(
     if series.empty:
         return pd.DataFrame(columns=columns)
     active = series[series["value"] > 0].groupby("group")["ts"].agg(["min", "max"])
-    frames = []
-    for group, (start, end) in active.iterrows():
-        idx = pd.MultiIndex.from_product([[group], pd.date_range(start, end, freq=step)], names=["group", "ts"])
-        frames.append(idx.to_frame(index=False))
-    grid = pd.concat(frames, ignore_index=True).merge(series, on=["group", "ts"], how="left")
+    grid = _life_grid(active, step).merge(series, on=["group", "ts"], how="left")
     grid["value"] = grid["value"].fillna(0.0).astype(float)
     if "n" in grid.columns:
         grid["n"] = grid["n"].fillna(0)

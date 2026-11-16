@@ -34,6 +34,7 @@ from jellybean.skills._shared.catalog import (
 from jellybean.skills._shared.column_stats import describe, type_family
 from jellybean.skills._shared.detection import (
     cluster_labels,
+    component_table,
     contextual_scores,
     event_unit,
     flag_top,
@@ -47,12 +48,14 @@ from jellybean.skills._shared.findings import (
     Finding,
     FindingNotFoundError,
     family_columns,
-    feature_tables,
+    feature_source,
     finding_entities,
+    group_signature,
     load_finding,
-    numeric_matrix,
+    numeric_columns,
+    read_features,
+    read_numeric_matrix,
     save_finding,
-    signature,
 )
 from jellybean.skills._shared.pattern_registry import best_match, classify_novelty, registry_key
 from jellybean.skills._shared.spec_tools import SpecMissingError, read_spec
@@ -87,80 +90,146 @@ def _runs(finding: Finding) -> list[tuple[str, dict[str, Any]]]:
     return [(rid, store.get(rid).params) for rid in finding.source_runs]
 
 
-def _matrix(features: str) -> tuple[pd.DataFrame, str]:
+def _matrix(features: str, columns: list[str] | None = None) -> tuple[pd.DataFrame, str]:
     store = _store()
     entity = store.get(features).params["entity"]
-    return numeric_matrix(pd.read_parquet(store.path_of(features)), entity), entity
+    return read_numeric_matrix(store.path_of(features), entity, columns=columns), entity
 
 
 # --------------------------------------------------------------------------- #
 # stability_check                                                             #
 # --------------------------------------------------------------------------- #
-def _redetect(finding: Finding, sample: set[Any], seed: int) -> set[Any]:
-    """Entities re-detected by the finding's source methods on a subsample."""
+# What a detection run finds again on one subsample does not depend on the finding
+# being checked: it is computed once per (run, subsample) and reused for every
+# finding of the run. Keys start with the run folder; values are sets of entities
+# (or the cluster labels).
+_REDETECT_CACHE: dict[tuple[Any, ...], Any] = {}
+_REDETECT_CACHE_MAX = 64
+
+
+def clear_redetect_cache() -> None:
+    _REDETECT_CACHE.clear()
+
+
+def _cached(key: tuple[Any, ...] | None, compute: Any) -> Any:
+    if key is None:
+        return compute()
+    key = (str(current_run().run_dir), *key)
+    if key not in _REDETECT_CACHE:
+        if len(_REDETECT_CACHE) >= _REDETECT_CACHE_MAX:
+            _REDETECT_CACHE.clear()
+        _REDETECT_CACHE[key] = compute()
+    return _REDETECT_CACHE[key]
+
+
+def _redetect(
+    finding: Finding,
+    sample: set[Any],
+    seed: int,
+    sample_key: tuple[Any, ...] | None = None,
+    tables: dict[Any, Any] | None = None,
+) -> set[Any]:
+    """Entities re-detected by the finding's source methods on a subsample.
+
+    ``sample_key`` identifies the subsample (results are then shared between
+    findings); ``tables`` keeps the matrices loaded during one stability check.
+    """
     cfg = _config().detection
     runs = _runs(finding)
-    outlier_runs = [p for _, p in runs if p["kind"] == "outlier"]
+    tables = {} if tables is None else tables
+
+    def loaded(key: Any, load: Any) -> Any:
+        if key not in tables:
+            tables[key] = load()
+        return tables[key]
+
+    def key_of(*parts: Any) -> tuple[Any, ...] | None:
+        return None if sample_key is None else (*parts, seed, *sample_key)
+
     found: set[Any] = set()
     # Outlier runs vote within their own feature space (all features, or one family).
-    spaces: dict[tuple[str, ...], list[dict[str, Any]]] = {}
-    for p in outlier_runs:
-        spaces.setdefault(tuple(p.get("families") or ()), []).append(p)
+    spaces: dict[tuple[str, ...], list[tuple[str, dict[str, Any]]]] = {}
+    for rid, p in runs:
+        if p["kind"] == "outlier":
+            spaces.setdefault(tuple(p.get("families") or ()), []).append((rid, p))
     for family, space_runs in spaces.items():
-        matrix, _ = _matrix(space_runs[0]["features"])
-        matrix = matrix[family_columns(list(matrix.columns), list(family) or None)]
-        sub = matrix[matrix.index.isin(sample)]
-        votes = np.zeros(len(sub))
-        for p in space_runs:
-            scores = outlier_scores(sub.to_numpy(), p["method"], p.get("method_params", {}), seed, cfg.lof_max_rows)
-            votes += flag_top(scores, p.get("contamination", cfg.contamination))
-        found |= set(sub.index[votes >= min(cfg.min_votes, len(space_runs))])
-    for _, p in runs:
-        if p["kind"] == "contextual":
-            raw = pd.read_parquet(_store().path_of(p["features"]))
-            raw = raw[raw[p["entity"]].isin(sample)].reset_index(drop=True)
-            scores, _ = contextual_scores(
-                raw,
-                p["entity"],
-                p["context_column"],
-                method=p.get("method_name", "context_defining"),
-                n_features=p.get("n_features", 8),
-            )
-            groups = raw[p["context_column"]].astype("string").fillna("__missing__")
-            quantile = p.get("min_support_quantile", 0.0)
-            if quantile and "n_events" in raw.columns:
-                scores = scores.where(~low_support(raw["n_events"], quantile), 0.0)
-            flags = flag_within_groups(scores, groups, p.get("contamination", cfg.contamination))
-            found |= set(raw.loc[flags.to_numpy(), p["entity"]])
-        elif p["kind"] == "cluster":
-            matrix, _ = _matrix(p["features"])
+
+        def outliers(family: tuple[str, ...] = family, space_runs: list[Any] = space_runs) -> set[Any]:
+            features = space_runs[0][1]["features"]
+
+            def load() -> pd.DataFrame:
+                store = _store()
+                entity = store.get(features).params["entity"]
+                names = numeric_columns(store.path_of(features), entity)
+                return _matrix(features, family_columns(names, list(family) or None))[0]
+
+            matrix = loaded(("matrix", features, family), load)
             sub = matrix[matrix.index.isin(sample)]
-            labels = pd.Series(
-                cluster_labels(
+            votes = np.zeros(len(sub))
+            for _, p in space_runs:
+                scores = outlier_scores(
                     sub.to_numpy(),
                     p["method"],
                     p.get("method_params", {}),
                     seed,
-                    max_rows=_config().detection.cluster_max_rows,
-                ),
-                index=sub.index,
-            )
+                    cfg.lof_max_rows,
+                    fit_max_rows=cfg.fit_max_rows,
+                )
+                votes += flag_top(scores, p.get("contamination", cfg.contamination))
+            return set(sub.index[votes >= min(cfg.min_votes, len(space_runs))])
+
+        found |= _cached(key_of("outlier", tuple(sorted(rid for rid, _ in space_runs))), outliers)
+    for rid, p in runs:
+        if p["kind"] == "contextual":
+
+            def contextual(p: dict[str, Any] = p) -> set[Any]:
+                raw = loaded(("raw", p["features"]), lambda: pd.read_parquet(_store().path_of(p["features"])))
+                raw = raw[raw[p["entity"]].isin(sample)].reset_index(drop=True)
+                scores, _ = contextual_scores(
+                    raw,
+                    p["entity"],
+                    p["context_column"],
+                    method=p.get("method_name", "context_defining"),
+                    n_features=p.get("n_features", 8),
+                )
+                groups = raw[p["context_column"]].astype("string").fillna("__missing__")
+                quantile = p.get("min_support_quantile", 0.0)
+                if quantile and "n_events" in raw.columns:
+                    scores = scores.where(~low_support(raw["n_events"], quantile), 0.0)
+                flags = flag_within_groups(scores, groups, p.get("contamination", cfg.contamination))
+                return set(raw.loc[flags.to_numpy(), p["entity"]])
+
+            found |= _cached(key_of("contextual", rid), contextual)
+        elif p["kind"] == "cluster":
+
+            def clusters(p: dict[str, Any] = p) -> pd.Series:
+                matrix = loaded(("matrix", p["features"], ()), lambda: _matrix(p["features"])[0])
+                sub = matrix[matrix.index.isin(sample)]
+                return pd.Series(
+                    cluster_labels(
+                        sub.to_numpy(), p["method"], p.get("method_params", {}), seed, max_rows=cfg.cluster_max_rows
+                    ),
+                    index=sub.index,
+                )
+
+            labels = _cached(key_of("cluster", rid), clusters)
             # The cluster that best matches the finding's members.
             inside = labels[labels.index.isin(_members(finding))]
             inside = inside[inside != -1]
             if not inside.empty:
                 found |= set(labels.index[labels == inside.mode().iloc[0]])
         elif p["kind"] == "graph" and p.get("method") in ("components", "communities"):
-            import networkx as nx
 
-            edges = pd.read_parquet(_store().path_of(p["graph"]))
-            edges = edges.sample(frac=0.8, random_state=seed)
-            edges = edges[edges["src"].isin(sample) & edges["dst"].isin(sample)]
-            g = nx.Graph()
-            g.add_edges_from(edges[["src", "dst"]].itertuples(index=False, name=None))
-            for component in nx.connected_components(g):
-                if len(component) >= cfg.min_group_size:
-                    found |= component
+            def components(p: dict[str, Any] = p) -> set[Any]:
+                edges = loaded(
+                    ("edges", p["graph"]), lambda: pd.read_parquet(_store().path_of(p["graph"]), columns=["src", "dst"])
+                )
+                edges = edges.sample(frac=0.8, random_state=seed)
+                edges = edges[edges["src"].isin(sample) & edges["dst"].isin(sample)]
+                groups = component_table(edges, "node")
+                return set(groups.loc[groups["group_size"] >= cfg.min_group_size, "node"])
+
+            found |= _cached(key_of("graph", rid), components)
     return found
 
 
@@ -221,14 +290,21 @@ def stability_check(
             recalls.append(len(hits) / len(mine))
     else:
         members = _members(f)
-        _, scaled, entity = feature_tables()
-        population = scaled[entity].tolist()
+        try:
+            source = feature_source()
+        except SpecMissingError as exc:
+            return ToolResult.error(str(exc))
+        population = read_features(source.scaled_path, source.entity, columns=[source.entity])[source.entity].tolist()
+        tables: dict[Any, Any] = {}
         for i in range(n_runs):
             sample = set(rng.choice(population, int(len(population) * subsample), replace=False))
             sampled_members = members & sample
             if not sampled_members:
                 continue
-            found = _redetect(f, sample, int(seed) + i + 1)
+            # The i-th subsample is the same for every finding checked with this seed and share.
+            found = _redetect(
+                f, sample, int(seed) + i + 1, sample_key=(str(source.scaled_path), seed, subsample, i), tables=tables
+            )
             recalls.append(len(sampled_members & found) / len(sampled_members))
             union = len(found | sampled_members)
             jaccards.append(len(found & sampled_members) / union if union else 0.0)
@@ -340,6 +416,32 @@ def _primary_with_files() -> tuple[str, Any]:
     return dataset_relation_with_files(info), info
 
 
+def _null_shares(path: Any) -> dict[str, float]:
+    """Share of nulls of every column of a Parquet file, from its metadata (no data is read)."""
+    import pyarrow.parquet as pq
+
+    meta = pq.read_metadata(path)
+    if meta.num_rows == 0:
+        return {}
+    nulls: dict[str, int] = {}
+    for g in range(meta.num_row_groups):
+        group = meta.row_group(g)
+        for c in range(group.num_columns):
+            column = group.column(c)
+            stats = column.statistics
+            if stats is None or not stats.has_null_count:
+                return _null_shares_by_reading(path)
+            nulls[column.path_in_schema] = nulls.get(column.path_in_schema, 0) + stats.null_count
+    return {name: n / meta.num_rows for name, n in nulls.items()}
+
+
+def _null_shares_by_reading(path: Any) -> dict[str, float]:
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    return {name: table.column(name).null_count / table.num_rows for name in table.column_names}
+
+
 def _association(name: str, finding_share: float, population_share: float, cfg: Any, **extra: Any) -> dict[str, Any]:
     lift = finding_share / population_share if population_share > 0 else (np.inf if finding_share > 0 else 1.0)
     suspicious = finding_share >= cfg.artifact_min_share and lift >= cfg.artifact_min_lift
@@ -351,6 +453,37 @@ def _association(name: str, finding_share: float, population_share: float, cfg: 
         "suspicious": bool(suspicious),
         **extra,
     }
+
+
+# Facts about the primary dataset that every artifact check of a run needs (row count,
+# null shares, rows per file, per-file medians): {(run folder, dataset): {fact: value}}.
+_SOURCE_FACTS: dict[tuple[str, str], dict[Any, Any]] = {}
+_SOURCE_FACTS_MAX = 8
+
+
+def clear_source_facts() -> None:
+    _SOURCE_FACTS.clear()
+
+
+def _source_facts(dataset: str) -> dict[Any, Any]:
+    key = (str(current_run().run_dir), dataset)
+    if key not in _SOURCE_FACTS:
+        if len(_SOURCE_FACTS) >= _SOURCE_FACTS_MAX:
+            _SOURCE_FACTS.clear()
+        _SOURCE_FACTS[key] = {}
+    return _SOURCE_FACTS[key]
+
+
+def _shifted_files(medians: list[tuple[Any, float | None]]) -> list[Any]:
+    """Files whose median of a measure is at least 10x away from the typical file median."""
+    values = [abs(v) for _, v in medians if v is not None]
+    if len(values) < 3:
+        return []
+    typical = float(np.median(values)) or 0.0
+    shifted = [
+        fl for fl, v in medians if v is not None and typical and (abs(v) / typical >= 10 or 0 < abs(v) / typical <= 0.1)
+    ]
+    return sorted(shifted, key=str)  # a stable order: the first files are shown as examples
 
 
 # Issue kinds that describe the observation itself (a day with more events), not
@@ -415,13 +548,13 @@ def artifact_check(finding: str) -> ToolResult:
                 if group_by:
                     cond += f" AND CAST({quote_ident(group_by)} AS VARCHAR) = '{str(w['group']).replace(chr(39), '')}'"
                 conds.append(f"({cond})")
-            con.execute(f"CREATE TEMP VIEW fin AS SELECT * FROM src WHERE {' OR '.join(conds) or 'false'}")
+            con.execute(f"CREATE TEMP TABLE fin AS SELECT * FROM src WHERE {' OR '.join(conds) or 'false'}")
             measures = [f.context.get("measure")] if f.context.get("measure") not in (None, "count") else []
         else:
             members = pd.DataFrame({"m": sorted(_members(f), key=str)})
             con.register("members_df", members)
             con.execute(
-                f"CREATE TEMP VIEW fin AS SELECT * FROM src WHERE CAST({quote_ident(entity)} AS VARCHAR) IN "
+                f"CREATE TEMP TABLE fin AS SELECT * FROM src WHERE CAST({quote_ident(entity)} AS VARCHAR) IN "
                 "(SELECT CAST(m AS VARCHAR) FROM members_df)"
             )
             sources = {t["feature"] for t in f.top_features}
@@ -432,8 +565,17 @@ def artifact_check(finding: str) -> ToolResult:
                 {dictionary.get(s) for s in sources}
                 & {c for c, t in schema.items() if type_family(t) in ("integer", "float")}
             )
-        n_fin = con.execute("SELECT count(*) FROM fin").fetchall()[0][0]
-        n_pop = con.execute("SELECT count(*) FROM src").fetchall()[0][0]
+        # The finding's rows are materialised once (table ``fin``); what is measured on
+        # the whole dataset does not depend on the finding and is kept for the next ones.
+        facts = _source_facts(info.name)
+        columns = [c for c in schema if c != FILE_COLUMN]
+        null_exprs = ", ".join(f"avg(({quote_ident(c)} IS NULL)::DOUBLE)" for c in columns)
+        fin_row = con.execute(f"SELECT count(*), {null_exprs} FROM fin").fetchall()[0]
+        n_fin, fin_nulls = fin_row[0], dict(zip(columns, fin_row[1:], strict=True))
+        if "rows" not in facts:
+            pop_row = con.execute(f"SELECT count(*), {null_exprs} FROM src").fetchall()[0]
+            facts["rows"], facts["nulls"] = pop_row[0], dict(zip(columns, pop_row[1:], strict=True))
+        n_pop = facts["rows"]
         if n_fin == 0:
             return ToolResult.error("The finding matches no rows of the primary dataset.")
 
@@ -444,79 +586,66 @@ def artifact_check(finding: str) -> ToolResult:
             ).fetchall()
             if rows:
                 file, n = rows[0]
-                pop = con.execute(f"SELECT count(*) FROM src WHERE {FILE_COLUMN} = ?", [file]).fetchall()[0][0]
+                if "files" not in facts:
+                    facts["files"] = dict(con.execute(f"SELECT {FILE_COLUMN}, count(*) FROM src GROUP BY 1").fetchall())
+                pop = facts["files"].get(file, 0)
                 associations.append(_association("single_source_file", n / n_fin, pop / n_pop, cfg, file=file))
 
         # 2) Files whose measure distribution is shifted (e.g. unit errors).
-        numeric = [c for c, t in schema.items() if type_family(t) in ("integer", "float") and c != FILE_COLUMN]
-        check_measures = measures or numeric
-        for m in check_measures:
-            q = quote_ident(m)
+        exact = n_pop <= _config().profiling.exact_stats_max_rows
+        missing = [m for m in measures if ("shift", m) not in facts]
+        if missing:
             # DOUBLE: DECIMAL columns would come back as Decimal and not mix with floats.
-            med = con.execute(f"SELECT {FILE_COLUMN}, median({q})::DOUBLE FROM src GROUP BY 1").fetchall()
-            values = [abs(v) for _, v in med if v is not None]
-            if len(values) < 3:
-                continue
-            typical = float(np.median(values)) or 0.0
-            shifted = [
-                fl
-                for fl, v in med
-                if v is not None and typical and (abs(v) / typical >= 10 or 0 < abs(v) / typical <= 0.1)
-            ]
+            median = "median({q})::DOUBLE" if exact else "approx_quantile({q}, 0.5)::DOUBLE"
+            exprs = ", ".join(median.format(q=quote_ident(m)) for m in missing)
+            per_file = con.execute(f"SELECT {FILE_COLUMN}, {exprs} FROM src GROUP BY 1").fetchall()
+            for pos, m in enumerate(missing, 1):
+                facts["shift", m] = _shifted_files([(row[0], row[pos]) for row in per_file])
+        for m in measures:
+            shifted = facts["shift", m]
             if not shifted:
                 continue
+            q = quote_ident(m)
             placeholders = ", ".join("?" for _ in shifted)
-            if m in measures:
-                # Compare like with like. Temporal findings are rows in time: share of
-                # their rows from shifted files vs the population's row share. Entity
-                # findings: share of their measure mass from shifted files vs the
-                # population's mass share (a dataset-wide shift affects everyone).
-                if f.type == "temporal":
-                    basis = "rows"
-                    fin_share = (
-                        con.execute(
-                            f"SELECT avg(({FILE_COLUMN} IN ({placeholders}))::DOUBLE) FROM fin", shifted
-                        ).fetchall()[0][0]
-                        or 0.0
-                    )
-                    pop_share = (
-                        con.execute(
-                            f"SELECT avg(({FILE_COLUMN} IN ({placeholders}))::DOUBLE) FROM src", shifted
-                        ).fetchall()[0][0]
-                        or 0.0
-                    )
-                else:
-                    basis = "measure mass"
-                    mass = (
-                        f"(sum(abs({q})) FILTER (WHERE {FILE_COLUMN} IN ({placeholders})) / nullif(sum(abs({q})), 0))"
-                        "::DOUBLE"
-                    )
-                    fin_share = con.execute(f"SELECT {mass} FROM fin", shifted).fetchall()[0][0] or 0.0
-                    pop_share = con.execute(f"SELECT {mass} FROM src", shifted).fetchall()[0][0] or 0.0
-                associations.append(
-                    _association(
-                        "scale_shifted_file", fin_share, pop_share, cfg, column=m, files=shifted[:3], basis=basis
-                    )
+            # Compare like with like. Temporal findings are rows in time: share of
+            # their rows from shifted files vs the population's row share. Entity
+            # findings: share of their measure mass from shifted files vs the
+            # population's mass share (a dataset-wide shift affects everyone).
+            shares = (
+                f"SELECT avg(({FILE_COLUMN} IN ({placeholders}))::DOUBLE), "
+                f"(sum(abs({q})) FILTER (WHERE {FILE_COLUMN} IN ({placeholders})) / nullif(sum(abs({q})), 0))::DOUBLE"
+            )
+            if ("shift_share", m) not in facts:
+                facts["shift_share", m] = con.execute(f"{shares} FROM src", shifted + shifted).fetchall()[0]
+            fin_shares = con.execute(f"{shares} FROM fin", shifted + shifted).fetchall()[0]
+            basis, pos = ("rows", 0) if f.type == "temporal" else ("measure mass", 1)
+            associations.append(
+                _association(
+                    "scale_shifted_file",
+                    fin_shares[pos] or 0.0,
+                    facts["shift_share", m][pos] or 0.0,
+                    cfg,
+                    column=m,
+                    files=shifted[:3],
+                    basis=basis,
                 )
+            )
 
         # 3) Timestamps outside their partition.
         part = next((c for c in info.partition_columns if type_family(schema.get(c, "")) == "temporal"), None)
         if part and time_col in schema:
             expr = f"avg((CAST({quote_ident(time_col)} AS DATE) <> CAST({quote_ident(part)} AS DATE))::DOUBLE)"
             fin_share = con.execute(f"SELECT {expr} FROM fin").fetchall()[0][0] or 0.0
-            pop_share = con.execute(f"SELECT {expr} FROM src").fetchall()[0][0] or 0.0
-            associations.append(_association("timestamp_outside_partition", fin_share, pop_share, cfg))
+            if "outside_partition" not in facts:
+                facts["outside_partition"] = con.execute(f"SELECT {expr} FROM src").fetchall()[0][0] or 0.0
+            associations.append(_association("timestamp_outside_partition", fin_share, facts["outside_partition"], cfg))
 
         # 4) Nulls concentrated in the finding.
-        for col in schema:
-            if col in (FILE_COLUMN,):
-                continue
-            q = quote_ident(col)
-            fin_null = con.execute(f"SELECT avg(({q} IS NULL)::DOUBLE) FROM fin").fetchall()[0][0] or 0.0
+        for col in columns:
+            fin_null = fin_nulls[col] or 0.0
             if fin_null == 0:
                 continue
-            pop_null = con.execute(f"SELECT avg(({q} IS NULL)::DOUBLE) FROM src").fetchall()[0][0] or 0.0
-            associations.append(_association("nulls", fin_null, pop_null, cfg, column=col))
+            associations.append(_association("nulls", fin_null, facts["nulls"][col] or 0.0, cfg, column=col))
     finally:
         con.close()
 
@@ -527,48 +656,62 @@ def artifact_check(finding: str) -> ToolResult:
         # finding's rows an operation touched vs the population's share. (Comparing
         # entities touched would be confounded by volume: an entity with many rows is
         # almost surely touched by a random deduplication.)
-        for record in store.list("table"):
-            if not record.id.startswith("transform_log_"):
-                continue
-            log = pd.read_parquet(store.path_of(record.id))
-            if entity not in log.columns:
-                continue
-            for op_id, block in log.groupby("op_id"):
-                in_finding = int(block[entity].isin(members).sum())
-                associations.append(
-                    _association(
-                        "cleaning_operation",
-                        in_finding / n_fin,
-                        len(block) / n_pop,
-                        cfg,
-                        operation=op_id,
-                        log=record.id,
-                        basis="rows",
-                    )
-                )
+        logs = [r.id for r in store.list("table") if r.id.startswith("transform_log_")]
+        if logs:
+            # Counted in DuckDB: a log has one row per affected source row and is never loaded whole.
+            con = connect()
+            try:
+                con.register("members_df", pd.DataFrame({"m": sorted(members, key=str)}))
+                for log_id in logs:
+                    if entity not in dict(describe(con, quote_ident(log_id))):
+                        continue
+                    per_op = con.execute(
+                        f"SELECT op_id, count(*), count(*) FILTER (WHERE CAST({quote_ident(entity)} AS VARCHAR) IN "
+                        f"(SELECT CAST(m AS VARCHAR) FROM members_df)) FROM {quote_ident(log_id)} "
+                        "GROUP BY op_id ORDER BY op_id"
+                    ).fetchall()
+                    for op_id, touched, in_finding in per_op:
+                        associations.append(
+                            _association(
+                                "cleaning_operation",
+                                in_finding / n_fin,
+                                touched / n_pop,
+                                cfg,
+                                operation=op_id,
+                                log=log_id,
+                                basis="rows",
+                            )
+                        )
+            finally:
+                con.close()
         # 6) Features that were null (imputed when scaling).
-        raw, _, entity_col = feature_tables()
-        in_group = raw[entity_col].isin(members)
+        features = feature_source()
+        entity_col, raw_columns = features.entity, features.columns("raw")
         # Low support: entities with very few events have unreliable features. This
         # does not make a finding an artefact, but it prevents "confirmed".
-        if "n_events" in raw.columns:
-            low_support_share = float(low_support(raw["n_events"])[in_group].mean())
+        if "n_events" in raw_columns:
+            support = read_features(features.raw_path, entity_col, columns=[entity_col, "n_events"])
+            in_group = support[entity_col].isin(members)
+            low_support_share = float(low_support(support["n_events"])[in_group].mean())
         # Only features of the finding's space matter: a group found on one family of
         # features is not explained by nulls in other features.
         families = f.context.get("families")
-        space = set(family_columns(list(raw.columns), families)) if families else set(raw.columns)
-        for col in raw.columns:
-            if col == entity_col or col not in space or not raw[col].isna().any():
-                continue
-            associations.append(
-                _association(
-                    "imputed_feature",
-                    float(raw.loc[in_group, col].isna().mean()),
-                    float(raw[col].isna().mean()),
-                    cfg,
-                    feature=col,
+        space = set(family_columns(raw_columns, families)) if families else set(raw_columns)
+        # Null counts come from the file's statistics; only the members' rows are read.
+        null_share = _null_shares(features.raw_path)
+        with_nulls = [c for c in raw_columns if c != entity_col and c in space and null_share.get(c, 0.0) > 0]
+        if with_nulls:
+            group = read_features(features.raw_path, entity_col, columns=[entity_col, *with_nulls], members=members)
+            for col in with_nulls:
+                associations.append(
+                    _association(
+                        "imputed_feature",
+                        float(group[col].isna().mean()) if len(group) else float("nan"),
+                        null_share[col],
+                        cfg,
+                        feature=col,
+                    )
                 )
-            )
 
     # 7) Unresolved quality issues on the same dates/files (temporal) or columns.
     unresolved = _unresolved_issues()
@@ -597,7 +740,7 @@ def artifact_check(finding: str) -> ToolResult:
     suspected = bool(reasons)
     top = sorted(associations, key=lambda a: (-a["suspicious"], -a["lift"] * a["finding_share"]))[:8]
     result = {"suspected": suspected, "reasons": reasons[:8], "associations": top}
-    if f.type != "temporal" and "n_events" in feature_tables()[0].columns:
+    if f.type != "temporal" and "n_events" in raw_columns:
         result["low_support_share"] = round(low_support_share, 4)
     _record_check(f, "artifact", result)
     return ToolResult.ok({"finding": f.id, **result})
@@ -641,23 +784,11 @@ def _rule_on_windows(spec: Any, entity: str, rule: dict[str, Any], windows: list
         f"AND ev.{t} >= TIMESTAMP '{w['start']}' AND ev.{t} < TIMESTAMP '{w['end']}')"
         for w in windows
     ]
-    table = f'"{spec.enriched_artifact}"'
     con = connect()
     try:
-        relation = f"(SELECT * FROM {table}) ev"
-        if rule.get("uses_ref"):
-            primary = spec.primary().name if spec.primary() else None
-            ref = next(
-                (r for r in spec.references if r.kind == "reference" and r.dataset == r.ref_dataset == primary), None
-            )
-            if ref is None:
-                return 0, 0
-            columns = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {table}").fetchall()]
-            ref_cols = ", ".join(f"p.{quote_ident(c)} AS {quote_ident('ref_' + c)}" for c in columns)
-            relation = (
-                f"(SELECT ev.*, {ref_cols} FROM {table} ev LEFT JOIN (SELECT DISTINCT * FROM {table}) p "
-                f"ON ev.{quote_ident(ref.column)} = p.{quote_ident(ref.ref_column)}) ev"
-            )
+        relation = _rule_relation(con, spec, entity, rule)
+        if relation is None:
+            return 0, 0
         rows, off = con.execute(
             f"SELECT count(*), count(*) FILTER (WHERE abs(CAST(({rule['observed']}) AS DOUBLE) - "
             f"CAST(({rule['expected']}) AS DOUBLE)) > {float(rule['tolerance'])}) FROM {relation} "
@@ -695,11 +826,21 @@ def explain_by_reference(finding: str) -> ToolResult:
     try:
         f = _load(finding)
         spec = read_spec()
-        raw, _, entity = feature_tables()
+        features = feature_source()
     except (FindingNotFoundError, SpecMissingError) as exc:
         return ToolResult.error(str(exc))
     store = _store()
+    entity = features.entity
     dictionary = store.load_json(spec.features.dictionary)["features"] if spec.features.dictionary else []
+    # Only the columns the tests below read: attributes and the counts of the conformity rules.
+    available = set(features.columns("raw"))
+    needed = [entity]
+    for d in dictionary:
+        if d["template"] == "attribute":
+            needed.append(d["name"])
+        elif d["template"] == "conformity" and d["name"].endswith("_violations"):
+            needed += [d["name"], d["name"][: -len("_violations")] + "_rows"]
+    raw = read_features(features.raw_path, entity, columns=[c for c in needed if c in available])
     primary = spec.primary().name if spec.primary() else None
     references = {j.right for j in spec.joins if j.status == "confirmed"}
     own = next((j.right for j in spec.joins if j.status == "confirmed" and j.keys[0][0] == entity), None)
@@ -844,32 +985,32 @@ def _attribution(spec: Any, entity: str, members: set[str], dictionary: list[dic
     best = None
     try:
         con.register("members_df", pd.DataFrame({"m": sorted(members)}))
-        relation = _rule_relation(con, spec)
+        key_columns = ", ".join(f"CAST(ev.{quote_ident(k)} AS VARCHAR) AS k{i}" for i, k in enumerate(keys))
+        mine_only = "ent IN (SELECT m FROM members_df)"
         for name, rule in rules.items():
-            off = (
-                f"coalesce(({rule['where']}), false) AND abs(CAST(({rule['observed']}) AS DOUBLE) - "
-                f"CAST(({rule['expected']}) AS DOUBLE)) > {float(rule['tolerance'])}"
+            relation = _rule_relation(con, spec, entity, rule)
+            if relation is None:
+                continue
+            # The rows off the rule are found once; every count below reads this small table.
+            con.execute(
+                f"CREATE OR REPLACE TEMP TABLE off_rows AS SELECT CAST(ev.{quote_ident(entity)} AS VARCHAR) AS ent, "
+                f"{key_columns} FROM {relation} WHERE coalesce(({rule['where']}), false) AND "
+                f"abs(CAST(({rule['observed']}) AS DOUBLE) - CAST(({rule['expected']}) AS DOUBLE)) > "
+                f"{float(rule['tolerance'])}"
             )
-            breakers = con.execute(
-                f"SELECT count(DISTINCT CAST(ev.{quote_ident(entity)} AS VARCHAR)) FROM {relation} WHERE {off} "
-                f"AND CAST(ev.{quote_ident(entity)} AS VARCHAR) IN (SELECT m FROM members_df)"
-            ).fetchall()[0][0]
+            breakers = con.execute(f"SELECT count(DISTINCT ent) FROM off_rows WHERE {mine_only}").fetchall()[0][0]
             if breakers < 0.5 * len(members):
                 continue  # the rule does not describe this group
-            for key in keys:
-                k = quote_ident(key)
+            for i, key in enumerate(keys):
                 mine = con.execute(
-                    f"SELECT CAST(ev.{k} AS VARCHAR), count(*) FROM {relation} WHERE {off} AND "
-                    f"CAST(ev.{quote_ident(entity)} AS VARCHAR) IN (SELECT m FROM members_df) "
-                    "GROUP BY 1 ORDER BY 2 DESC"
+                    f"SELECT k{i}, count(*) FROM off_rows WHERE {mine_only} GROUP BY 1 ORDER BY 2 DESC"
                 ).fetchall()
                 total_mine = sum(n for _, n in mine)
                 if not total_mine or mine[0][0] is None:
                     continue
                 value, n = mine[0]
                 everyone = con.execute(
-                    f"SELECT count(*), count(*) FILTER (WHERE CAST(ev.{k} AS VARCHAR) = ?) FROM {relation} WHERE {off}",
-                    [value],
+                    f"SELECT count(*), count(*) FILTER (WHERE k{i} = ?) FROM off_rows", [value]
                 ).fetchall()[0]
                 share, of_all = n / total_mine, everyone[1] / max(everyone[0], 1)
                 if share >= 0.8 and of_all >= 0.5 and (best is None or share > best["share_of_member_violations"]):
@@ -885,17 +1026,31 @@ def _attribution(spec: Any, entity: str, members: set[str], dictionary: list[dic
     return best
 
 
-def _rule_relation(con: Any, spec: Any) -> str:
-    """The enriched table aliased ``ev``, with ``ref_<column>`` of the referred row when there is a self-reference."""
+def _rule_relation(con: Any, spec: Any, entity: str, rule: dict[str, Any]) -> str | None:
+    """The enriched table aliased ``ev`` for one conformity rule.
+
+    A rule that reads ``ref_<column>`` gets those columns of the referred row
+    (the dataset's self-reference); None when the spec has no self-reference.
+    As in build_conformity_features, the referred rows are reduced to the
+    columns the rule reads before they are deduplicated and joined.
+    """
     table = f'"{spec.enriched_artifact}"'
+    text = f"{rule['observed']} {rule['expected']} {rule['where']}"
+    uses_ref = rule.get("uses_ref")
+    if uses_ref is None:  # rules recorded before the flag existed
+        uses_ref = "ref_" in text
+    if not uses_ref:
+        return f"(SELECT * FROM {table}) ev"
     primary = spec.primary().name if spec.primary() else None
     ref = next((r for r in spec.references if r.kind == "reference" and r.dataset == r.ref_dataset == primary), None)
     if ref is None:
-        return f"(SELECT * FROM {table}) ev"
+        return None
     columns = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {table}").fetchall()]
-    ref_cols = ", ".join(f"p.{quote_ident(c)} AS {quote_ident('ref_' + c)}" for c in columns)
+    keep = [c for c in columns if c in (entity, ref.column, ref.ref_column) or c in text]
+    ref_cols = ", ".join(f"p.{quote_ident(c)} AS {quote_ident('ref_' + c)}" for c in keep if "ref_" + c not in columns)
+    referred = f"(SELECT DISTINCT {', '.join(quote_ident(c) for c in keep)} FROM {table})"
     return (
-        f"(SELECT ev.*, {ref_cols} FROM {table} ev LEFT JOIN (SELECT DISTINCT * FROM {table}) p "
+        f"(SELECT ev.*, {ref_cols} FROM {table} ev LEFT JOIN {referred} p "
         f"ON ev.{quote_ident(ref.column)} = p.{quote_ident(ref.ref_column)}) ev"
     )
 
@@ -920,7 +1075,14 @@ def rerun_on_version(finding: str, artifact_version: str, seed: int | None = Non
         return ToolResult.error("This finding was not produced by outlier methods; use stability_check instead.")
     votes = np.zeros(len(matrix))
     for p in outlier_runs:
-        scores = outlier_scores(matrix.to_numpy(), p["method"], p.get("method_params", {}), int(seed), cfg.lof_max_rows)
+        scores = outlier_scores(
+            matrix.to_numpy(),
+            p["method"],
+            p.get("method_params", {}),
+            int(seed),
+            cfg.lof_max_rows,
+            fit_max_rows=cfg.fit_max_rows,
+        )
         votes += flag_top(scores, p.get("contamination", cfg.contamination))
     found = set(matrix.index[votes >= min(cfg.min_votes, len(outlier_runs))])
     members = _members(f) & set(matrix.index)
@@ -958,6 +1120,13 @@ def inject_synthetic_anomalies(
         return ToolResult.error("No outlier detection runs in this run.")
     rng = np.random.default_rng(seed)
     base = matrix.to_numpy()
+    cfg = _config().detection
+    sampled = len(base) > cfg.fit_max_rows
+    if sampled:
+        # The planted rows are judged against a seeded sample of the population: refitting
+        # every method on millions of rows would cost as much as the detection itself.
+        base = base[np.sort(rng.choice(len(base), cfg.fit_max_rows, replace=False))]
+    del matrix
     rows = base[rng.choice(len(base), n, replace=True)].copy()
     cols = rng.choice(base.shape[1], 3, replace=False)
     if kind == "extreme":
@@ -968,10 +1137,12 @@ def inject_synthetic_anomalies(
         rows[:, cols] += 6.0
         rows += rng.normal(0, 0.1, rows.shape)
     X = np.vstack([base, rows])
-    cfg = _config().detection
+    del base
     per_method, votes = [], np.zeros(n)
     for p in runs:
-        scores = outlier_scores(X, p["method"], p.get("method_params", {}), int(seed), cfg.lof_max_rows)
+        scores = outlier_scores(
+            X, p["method"], p.get("method_params", {}), int(seed), cfg.lof_max_rows, fit_max_rows=cfg.fit_max_rows
+        )
         flags = flag_top(scores, p.get("contamination", cfg.contamination))[-n:]
         votes += flags
         per_method.append({"method": p["method"], "detection_rate": round(float(flags.mean()), 4)})
@@ -981,7 +1152,8 @@ def inject_synthetic_anomalies(
             "planted": n,
             "per_method": per_method,
             "detected_by_2_plus": round(float((votes >= 2).mean()), 4),
-        }
+        },
+        warnings=[f"Measured against a sample of {cfg.fit_max_rows} entities."] if sampled else [],
     )
 
 
@@ -1055,8 +1227,7 @@ def match_pattern_registry(finding: str) -> ToolResult:
             "centroid": {},
         }
     else:
-        raw, scaled, entity = feature_tables()
-        sig = signature(raw, scaled, entity, _members(f), f.top_features or None, f.rules)
+        sig = group_signature(_members(f), f.top_features or None, f.rules)
     pattern, score = best_match(ctx, registry_key(spec), sig, f.type)
     novelty = classify_novelty(score, thresholds.known_threshold, thresholds.variant_threshold)
     f.novelty = novelty

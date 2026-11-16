@@ -247,6 +247,7 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         elif isinstance(op, DropRowsOp):
             _check_condition(op.where)
             removed = True
+            changed_where = f"coalesce(({op.where}), false)"  # the removed rows, read straight from `prev`
             con.execute(f"CREATE TEMP TABLE {cur} AS SELECT * FROM {prev} WHERE NOT coalesce(({op.where}), false)")
         elif isinstance(op, CastOp):
             target = op.to.upper()
@@ -345,7 +346,10 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         after = con.execute(f"SELECT count(*) FROM {cur}").fetchall()[0][0]
         if removed:
             affected = before - after
-            if keys and affected:
+            if keys and affected and changed_where:
+                con.execute(f"INSERT INTO __log SELECT '{op_id}', {key_sql} FROM {prev} WHERE {changed_where}")
+            elif keys and affected:
+                # Deduplication: the removed rows are the difference between the two steps.
                 con.execute(
                     f"INSERT INTO __log SELECT '{op_id}', {key_sql} FROM "
                     f"(SELECT {key_sql} FROM {prev} EXCEPT ALL SELECT {key_sql} FROM {cur})"

@@ -26,17 +26,20 @@ from jellybean.skills._shared.artifacts import ArtifactStore
 from jellybean.skills._shared.findings import (
     Finding,
     FindingNotFoundError,
-    effect_sizes,
-    feature_tables,
+    feature_source,
     finding_entities,
+    group_effect_sizes,
+    group_signature,
     load_finding,
     numeric_matrix,
+    read_features,
     save_finding,
-    signature,
 )
 from jellybean.skills._shared.masking import Masker
 from jellybean.skills._shared.pattern_registry import add_pattern, registry_key
 from jellybean.skills._shared.spec_tools import SpecMissingError, read_spec
+
+_MAX_ENCODED_LEVELS = 100  # attributes with more values are not one-hot encoded for surrogate rules
 
 
 def _store() -> ArtifactStore:
@@ -108,16 +111,16 @@ def describe_group(finding: str) -> ToolResult:
                 "windows": windows[:10],
             }
         )
+    members = _members(f)
     try:
-        raw, _, entity = feature_tables()
+        top = group_effect_sizes(members, top=10)
+        population = feature_source().n_rows()
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
-    members = _members(f)
-    top = effect_sizes(raw, entity, members, top=10)
     f.top_features = top
     save_finding(f)
     return ToolResult.ok(
-        {"finding": f.id, "type": f.type, "size": len(members), "population": len(raw), "top_features": top}
+        {"finding": f.id, "type": f.type, "size": len(members), "population": population, "top_features": top}
     )
 
 
@@ -129,6 +132,9 @@ def fit_surrogate_rules(
 
     Each rule describes a leaf predicting membership, with its precision (share
     of matched entities that are members) and coverage (share of members it matches).
+    On large populations the tree is fitted on the members and a seeded sample of
+    the other entities (`detection.surrogate_max_rows`); precision is then
+    estimated from that sample. Attributes with more than 100 values are not used.
 
     Args:
         finding: Finding id.
@@ -139,16 +145,36 @@ def fit_surrogate_rules(
 
     try:
         f = _load(finding)
-        raw, _, entity = feature_tables()
+        source = feature_source()
     except (FindingNotFoundError, SpecMissingError) as exc:
         return ToolResult.error(str(exc))
     if f.type == "temporal":
         return ToolResult.error("Surrogate rules apply to entity findings, not to temporal windows.")
     members = _members(f)
+    entity = source.entity
+    cap = current_run().settings.config.detection.surrogate_max_rows
+    others_weight = 1.0  # entities of the population each sampled non-member stands for
+    warnings: list[str] = []
+    if source.n_rows() - len(members) <= cap:
+        raw = pd.read_parquet(source.raw_path)
+    else:
+        ids = read_features(source.raw_path, entity, columns=[entity])[entity]
+        others = ids[~ids.isin(members)].to_numpy()
+        chosen = others[np.sort(np.random.default_rng(seed).choice(len(others), cap, replace=False))]
+        raw = read_features(source.raw_path, entity, members=[*members, *chosen.tolist()])
+        others_weight = len(others) / cap
+        warnings.append(
+            f"The tree was fitted on the members and a sample of {cap} of the {len(others)} other entities; "
+            "precision is estimated from that sample."
+        )
     X = raw.drop(columns=[entity])
     numeric = X.select_dtypes(include=["number", "bool"]).astype(float)
     numeric = numeric.fillna(numeric.median()).fillna(0.0)
     text = X.select_dtypes(exclude=["number", "bool"])
+    wide = [c for c in text.columns if text[c].nunique() > _MAX_ENCODED_LEVELS]
+    if wide:
+        text = text.drop(columns=wide)
+        warnings.append(f"Attributes with more than {_MAX_ENCODED_LEVELS} values were not used: {wide[:5]}.")
     # No categorical attribute (e.g. a dataset without enrichment): numeric features only.
     categorical = (
         pd.get_dummies(text.astype("string").fillna("__missing__"), prefix_sep="=", dtype=float)
@@ -167,15 +193,15 @@ def fit_surrogate_rules(
                 feat, op, value = cond.rsplit(" ", 2)
                 col = data[feat].to_numpy()
                 leaf_mask &= col <= float(value) if op == "<=" else col > float(value)
-            matched = leaf_mask.sum()
             hits = (leaf_mask & y).sum()
+            matched = hits + (leaf_mask & ~y).sum() * others_weight
             if matched and hits / matched >= 0.3:
                 rules.append(
                     {
                         "rule": " AND ".join(conditions) or "(all)",
                         "precision": round(float(hits / matched), 4),
                         "coverage": round(float(hits / y.sum()), 4),
-                        "matched": int(matched),
+                        "matched": round(matched),
                     }
                 )
             return
@@ -195,7 +221,8 @@ def fit_surrogate_rules(
     f.rules = rules[:3]
     save_finding(f)
     return ToolResult.ok(
-        {"finding": f.id, "rules": f.rules, "total_coverage": round(sum(r["coverage"] for r in f.rules), 4)}
+        {"finding": f.id, "rules": f.rules, "total_coverage": round(sum(r["coverage"] for r in f.rules), 4)},
+        warnings=warnings,
     )
 
 
@@ -231,16 +258,17 @@ def get_exemplars(finding: str, k: Annotated[int, Field(ge=1, le=10)] = 5) -> To
             {"finding": f.id, "columns": ["group", "start", "end", "observed", "expected"], "rows": rows}
         )
     try:
-        raw, scaled, entity = feature_tables()
+        source = feature_source()
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
+    entity = source.entity
     members = _members(f)
-    matrix = numeric_matrix(scaled, entity)
-    group = matrix[matrix.index.isin(members)]
+    group = numeric_matrix(read_features(source.scaled_path, entity, members=members), entity)
     distance = ((group - group.median()) ** 2).sum(axis=1).sort_values()
     chosen = distance.index[:k]
-    features = [t["feature"] for t in (f.top_features or effect_sizes(raw, entity, members))[:5]]
-    table = raw.set_index(entity).loc[chosen, features].reset_index()
+    features = [t["feature"] for t in (f.top_features or group_effect_sizes(members))[:5]]
+    rows_of = read_features(source.raw_path, entity, columns=[entity, *features], members=chosen)
+    table = rows_of.set_index(entity).loc[chosen, features].reset_index()
     rows = [
         [masker.mask_value(r[0]), *[round(v, 4) if isinstance(v, float) else v for v in r[1:]]]
         for r in table.itertuples(index=False, name=None)
@@ -263,6 +291,16 @@ def make_plot(finding: str, kind: Literal["feature_distributions", "embedding", 
         finding: Finding id.
         kind: Plot type.
     """
+    # Whatever happens while drawing, no figure stays open (each one holds its data).
+    open_before = set(plt.get_fignums())
+    try:
+        return _make_plot(finding, kind)
+    finally:
+        for number in set(plt.get_fignums()) - open_before:
+            plt.close(number)
+
+
+def _make_plot(finding: str, kind: str) -> ToolResult:
     try:
         f = _load(finding)
         spec = read_spec()
@@ -289,12 +327,21 @@ def make_plot(finding: str, kind: Literal["feature_distributions", "embedding", 
     else:
         if f.type == "temporal":
             return ToolResult.error("Use kind 'timeseries' for temporal findings.")
-        raw, _scaled, entity = feature_tables()
+        try:
+            source = feature_source()
+        except SpecMissingError as exc:
+            return ToolResult.error(str(exc))
+        entity = source.entity
         members = _members(f)
         if kind == "embedding":
             if not spec.features.embedding:
                 return ToolResult.error("No embedding in the spec.")
-            emb = pd.read_parquet(store.path_of(spec.features.embedding))
+            from jellybean.skills._shared.plots import _max_points, _thin
+
+            emb = pd.read_parquet(store.path_of(spec.features.embedding), columns=[entity, "c1", "c2"])
+            inside = emb[entity].isin(members)
+            # A sample of the population is enough for the background; every member is drawn.
+            emb = emb[_thin(emb.index, inside.to_numpy(), _max_points())].reset_index(drop=True)
             inside = emb[entity].isin(members)
             fig, ax = plt.subplots(figsize=(6, 5))
             ax.scatter(emb.loc[~inside, "c1"], emb.loc[~inside, "c2"], s=2, alpha=0.2, color="grey", label="population")
@@ -304,10 +351,9 @@ def make_plot(finding: str, kind: Literal["feature_distributions", "embedding", 
             ax.legend()
         else:
             top = [
-                t["feature"]
-                for t in (f.top_features or effect_sizes(raw, entity, members))
-                if t.get("kind") != "categorical"
+                t["feature"] for t in (f.top_features or group_effect_sizes(members)) if t.get("kind") != "categorical"
             ][:3]
+            raw = read_features(source.raw_path, entity, columns=[entity, *top])
             fig, axes = plt.subplots(1, max(1, len(top)), figsize=(4 * max(1, len(top)), 3.5))
             axes = np.atleast_1d(axes)
             inside = raw[entity].isin(members)
@@ -392,8 +438,7 @@ def register_pattern(finding: str) -> ToolResult:
             "centroid": {},
         }
     else:
-        raw, scaled, entity = feature_tables()
-        sig = signature(raw, scaled, entity, _members(f), f.top_features or None, f.rules)
+        sig = group_signature(_members(f), f.top_features or None, f.rules)
     pattern_id = add_pattern(
         ctx,
         registry_key(spec),

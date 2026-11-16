@@ -18,6 +18,7 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from pydantic import Field
 
 from jellybean.runtime.context import current_run
@@ -28,6 +29,7 @@ from jellybean.skills._shared.column_stats import describe, type_family
 from jellybean.skills._shared.detection import (
     DetectionError,
     cluster_labels,
+    component_table,
     contextual_scores,
     event_unit,
     flag_top,
@@ -41,10 +43,12 @@ from jellybean.skills._shared.detection import (
 from jellybean.skills._shared.findings import (
     Finding,
     all_findings,
-    effect_sizes,
     family_columns,
-    feature_tables,
-    numeric_matrix,
+    feature_source,
+    group_effect_sizes,
+    numeric_columns,
+    read_features,
+    read_numeric_matrix,
     save_finding,
 )
 from jellybean.skills._shared.masking import Masker
@@ -64,15 +68,20 @@ def _cfg():
     return current_run().settings.config.detection
 
 
-def _load_matrix(features: str) -> tuple[pd.DataFrame, str]:
-    """Numeric scaled matrix (indexed by entity) and the entity column."""
+def _load_matrix(features: str, families: list[str] | None = None) -> tuple[pd.DataFrame, str]:
+    """Numeric scaled matrix (indexed by entity) and the entity column.
+
+    With ``families`` only the columns of those feature templates are read (the
+    matrix has no column when the table has no feature of these families).
+    """
     store = _store()
     record = store.get(features)
     entity = record.params.get("entity")
     if not entity:
         raise ValueError(f"'{features}' is not a feature table.")
-    df = pd.read_parquet(store.path_of(features))
-    matrix = numeric_matrix(df, entity)
+    path = store.path_of(features)
+    columns = family_columns(numeric_columns(path, entity), families) if families else None
+    matrix = read_numeric_matrix(path, entity, columns=columns)
     if matrix.isna().any().any():
         raise ValueError(f"'{features}' has nulls: use the scaled table (scale_encode output).")
     return matrix, entity
@@ -113,23 +122,20 @@ def run_outlier_detector(
     cfg = _cfg()
     contamination = contamination or cfg.contamination
     try:
-        matrix, entity = _load_matrix(features)
-        if families:
-            columns = family_columns(list(matrix.columns), families)
-            if not columns:
-                # Not an error: the feature table simply has no feature of this family.
-                return ToolResult.ok(
-                    {"skipped": True, "families": families, "reason": "no feature of these families"},
-                    warnings=[
-                        f"No feature of the families {families} in '{features}': skipped (no run to consolidate)."
-                    ],
-                )
-            matrix = matrix[columns]
+        matrix, entity = _load_matrix(features, families)
+        if families and not matrix.shape[1]:
+            # Not an error: the feature table simply has no feature of this family.
+            return ToolResult.ok(
+                {"skipped": True, "families": families, "reason": "no feature of these families"},
+                warnings=[f"No feature of the families {families} in '{features}': skipped (no run to consolidate)."],
+            )
         # Small populations: room for one group on which two methods can agree.
         floor = 2 * cfg.min_group_size
         if len(matrix) * contamination < floor <= len(matrix) / 2:
             contamination = floor / len(matrix)
-        scores = outlier_scores(matrix.to_numpy(), method, params or {}, int(seed), cfg.lof_max_rows)
+        scores = outlier_scores(
+            matrix.to_numpy(), method, params or {}, int(seed), cfg.lof_max_rows, fit_max_rows=cfg.fit_max_rows
+        )
     except (ArtifactNotFoundError, ValueError, DetectionError) as exc:
         return ToolResult.error(str(exc))
     flagged = flag_top(scores, contamination)
@@ -264,23 +270,46 @@ def run_graph_analysis(graph: str, method: GraphMethod = "components", seed: int
         method: components, communities or centrality.
         seed: Seed for community detection.
     """
-    import networkx as nx
-
     store = _store()
     try:
         record = store.get(graph)
-        edges = pd.read_parquet(store.path_of(graph))
+        path = store.path_of(graph)
+        columns = set(pq.read_schema(path).names)
     except (ArtifactNotFoundError, FileNotFoundError):
         return ToolResult.error(f"Unknown graph artifact '{graph}'.")
     entity = record.params.get("entity")
-    if not entity or not {"src", "dst"} <= set(edges.columns):
+    if not entity or not {"src", "dst"} <= columns:
         return ToolResult.error(f"'{graph}' is not a graph edges artifact.")
-    g = nx.Graph()
-    g.add_weighted_edges_from(edges[["src", "dst", "weight"]].itertuples(index=False, name=None))
     min_size = _cfg().min_group_size
     if method == "components":
-        groups = [sorted(c) for c in nx.connected_components(g)]
-    elif method == "communities":
+        # Components need no graph library: a sparse matrix of integer codes handles millions of edges.
+        table = component_table(pd.read_parquet(path, columns=["src", "dst"]), entity)
+        table["flagged"] = table["group_size"] >= min_size
+        table["score"] = table["group_size"].astype(float)
+        run_id = _save_run("graph", method, table, [graph], {"entity": entity, "graph": graph, "seed": seed})
+        sizes = table.drop_duplicates("group")["group_size"].tolist()
+        return ToolResult.ok(
+            {
+                "method": method,
+                "nodes": len(table),
+                "groups": len(sizes),
+                "flagged_groups": sum(1 for s in sizes if s >= min_size),
+                "largest_sizes": sizes[:8],
+            },
+            artifact_id=run_id,
+        )
+    import networkx as nx
+
+    n_edges = int(pq.read_metadata(path).num_rows)
+    if n_edges > _cfg().graph_max_edges:
+        return ToolResult.error(
+            f"The graph has {n_edges} edges, more than detection.graph_max_edges ({_cfg().graph_max_edges}): "
+            f"'{method}' would not finish. Use method 'components', or build the graph with a higher minimum weight."
+        )
+    edges = pd.read_parquet(path)
+    g = nx.Graph()
+    g.add_weighted_edges_from(edges[["src", "dst", "weight"]].itertuples(index=False, name=None))
+    if method == "communities":
         groups = [sorted(c) for c in nx.community.louvain_communities(g, weight="weight", seed=seed)]
     else:
         centrality = nx.degree_centrality(g)
@@ -466,14 +495,18 @@ def run_contextual_outliers(
     store = _store()
     try:
         entity = store.get(features).params.get("entity")
-        raw = pd.read_parquet(store.path_of(features))
+        path = store.path_of(features)
+        available = list(pq.read_schema(path).names)
     except (ArtifactNotFoundError, FileNotFoundError):
         return ToolResult.error(f"Unknown feature table '{features}'.")
     if not entity:
         return ToolResult.error(f"'{features}' is not a feature table.")
-    if context_column not in raw.columns:
-        attrs = [c for c in raw.columns if c.startswith("attr_")]
+    if context_column not in available:
+        attrs = [c for c in available if c.startswith("attr_")]
         return ToolResult.error(f"Unknown context column '{context_column}'. Attributes: {attrs}")
+    # The other attributes are not used: only the context and the numeric features are read.
+    wanted = {entity, context_column, *numeric_columns(path, entity)}
+    raw = read_features(path, entity, columns=[c for c in available if c in wanted])
     groups = raw[context_column].astype("string").fillna("__missing__")
     try:
         scores, z = contextual_scores(raw, entity, context_column, method=method, n_features=n_features)
@@ -580,12 +613,27 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     if len(kinds.get("outlier", [])) < 2 or not kinds.get("cluster"):
         return ToolResult.error("Use at least two outlier methods and one clustering method before consolidating.")
     try:
-        raw, scaled, entity = feature_tables()
+        source = feature_source()
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
-    matrix = numeric_matrix(scaled, entity)
-    n_entities = len(matrix)
+    entity = source.entity
+    scaled_columns = numeric_columns(source.scaled_path, entity)
+    n_entities = source.n_rows()
     candidates: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    def space_of(pool: list[Any], columns: list[str] | None = None) -> pd.DataFrame:
+        """Scaled features of the pooled entities only (the grouping reads no other row)."""
+        return read_numeric_matrix(source.scaled_path, entity, columns=columns, members=pool)
+
+    def largest(found: list[dict[str, Any]], run: str) -> list[dict[str, Any]]:
+        """The largest groups of one run: merging compares every pair of candidates."""
+        if len(found) <= cfg.max_candidates_per_run:
+            return found
+        warnings.append(
+            f"Run '{run}' has {len(found)} candidate groups: only the {cfg.max_candidates_per_run} largest are used."
+        )
+        return sorted(found, key=lambda c: -len(c["members"]))[: cfg.max_candidates_per_run]
 
     # Outliers: votes across the methods run on the same features (all features,
     # or one family), then grouped by deviation direction in that space.
@@ -600,7 +648,7 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
         min_votes = min(cfg.min_votes, len(outlier_tables))
         # Families keep entities pooled elsewhere: overlapping groups are merged below.
         pool = votes[votes >= min_votes].index.tolist()
-        space = matrix[family_columns(list(matrix.columns), list(family))] if family else matrix
+        space = space_of(pool, family_columns(scaled_columns, list(family)) if family else None)
         suffix = f"[{','.join(family)}]" if family else ""
         methods = [rec.params["method"] + suffix for _, rec in family_runs]
         for group in _group_entities(space, pool, cfg.group_distance, cfg.min_group_size):
@@ -625,8 +673,8 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     for rid, record in kinds.get("contextual", []):
         table = pd.read_parquet(store.path_of(rid)).set_index(entity)
         zcols = [c for c in table.columns if c.startswith("z__")]
-        zmatrix = table[zcols] if zcols else matrix
         flagged = table[table["flagged"] & ~table.index.isin(global_pool)]
+        zmatrix = table[zcols] if zcols else space_of(flagged.index.tolist())
         for value, block in flagged.groupby("context"):
             for group in _group_entities(zmatrix, block.index.tolist(), cfg.group_distance, cfg.min_group_size):
                 candidates.append(
@@ -646,35 +694,37 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
 
     # Small clusters.
     for rid, record in kinds["cluster"]:
-        table = pd.read_parquet(store.path_of(rid))
-        for label, block in table[table["flagged"]].groupby("label"):
-            candidates.append(
-                {
-                    "type": "cluster",
-                    "members": set(block[entity]),
-                    "methods": [record.params["method"]],
-                    "source_runs": [rid],
-                    "scores": {"cluster_share": round(len(block) / n_entities, 5)},
-                    "context": {"label": int(label)},
-                }
-            )
+        table = pd.read_parquet(store.path_of(rid), columns=[entity, "label", "flagged"])
+        found = [
+            {
+                "type": "cluster",
+                "members": set(block[entity]),
+                "methods": [record.params["method"]],
+                "source_runs": [rid],
+                "scores": {"cluster_share": round(len(block) / n_entities, 5)},
+                "context": {"label": int(label)},
+            }
+            for label, block in table[table["flagged"]].groupby("label")
+        ]
+        candidates += largest(found, rid)
 
     # Graph groups.
     for rid, record in kinds.get("graph", []):
         table = pd.read_parquet(store.path_of(rid))
         if "group_size" not in table.columns:
             continue
-        for gid, block in table[table["flagged"]].groupby("group"):
-            candidates.append(
-                {
-                    "type": "community",
-                    "members": set(block[entity]),
-                    "methods": [f"graph:{record.params['method']}"],
-                    "source_runs": [rid],
-                    "scores": {"group_size": len(block)},
-                    "context": {"group": int(gid)},
-                }
-            )
+        found = [
+            {
+                "type": "community",
+                "members": set(block[entity]),
+                "methods": [f"graph:{record.params['method']}"],
+                "source_runs": [rid],
+                "scores": {"group_size": len(block)},
+                "context": {"group": int(gid)},
+            }
+            for gid, block in table[table["flagged"]].groupby("group")
+        ]
+        candidates += largest(found, rid)
 
     # Merge overlapping entity findings, keeping the highest-priority type. Repeat
     # until stable: a merge can create new overlaps.
@@ -800,7 +850,7 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
         else:
             ids = pd.DataFrame({entity: sorted(cand["members"], key=str)})
             entity_column = entity
-            top = effect_sizes(raw, entity, cand["members"])
+            top = group_effect_sizes(cand["members"])
         ids_record = store.save_dataframe(
             f"finding_{fid.lower()}_entities",
             ids,
@@ -833,4 +883,6 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
             }
         )
     patch_spec({"phase": "critique"})
-    return ToolResult.ok({"findings": summaries, "pooled_outliers": len(pool), "dropped_by_cap": dropped})
+    return ToolResult.ok(
+        {"findings": summaries, "pooled_outliers": len(pool), "dropped_by_cap": dropped}, warnings=warnings
+    )

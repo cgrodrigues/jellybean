@@ -37,11 +37,13 @@ from jellybean.runtime.tool_registry import ToolResult, tool
 from jellybean.skills._shared.artifacts import ArtifactNotFoundError
 from jellybean.skills._shared.catalog import SourceNotFoundError, connect, quote_ident, resolve_source, sql_escape
 from jellybean.skills._shared.column_stats import describe
+from jellybean.skills._shared.detection import component_table
 from jellybean.skills._shared.spec_tools import SpecMissingError, patch_spec, read_spec
 from jellybean.skills._shared.sql_guard import SQLRejectedError, validate_select
 from jellybean.skills.feature_engineer._common import _feature_name, _load_table, _store, latest_features
 
 _MAX_LEVELS = 16
+_MAX_GRAPH_EDGES = 50_000_000  # distinct entity pairs an interaction graph can hold in memory
 _MIN_SUPPORT = 20
 # A response is "expected" when at least this share of the population has it.
 _EXPECTED_SHARE = 0.5
@@ -110,8 +112,16 @@ def _extend(
     return record.id
 
 
-def _open_events(input: str, entity: str, needed: list[str | None]) -> tuple[duckdb.DuckDBPyConnection, dict[str, str]]:
-    """Connection with a temp table ``ev`` (rows with an entity); checks the columns exist."""
+def _open_events(
+    input: str, entity: str, needed: list[str | None], spec: Any = None, expressions: str | None = None
+) -> tuple[duckdb.DuckDBPyConnection, dict[str, str]]:
+    """Connection with a temp table ``ev`` (rows with an entity); checks the columns exist.
+
+    ``ev`` holds only the columns the tool reads, not the whole event table: the
+    entity, ``needed``, the self-reference of ``spec`` (when given) and every
+    column named in ``expressions`` (agent-written SQL; ``ref_<column>`` counts
+    as ``<column>``). The returned schema is the schema of ``ev``.
+    """
     source = resolve_source(input)
     con = connect()
     try:
@@ -119,11 +129,21 @@ def _open_events(input: str, entity: str, needed: list[str | None]) -> tuple[duc
         missing = [c for c in [entity, *needed] if c and c not in schema]
         if missing:
             raise ValueError(f"Unknown columns: {missing}. Columns: {list(schema)}")
-        con.execute(f"CREATE TEMP TABLE ev AS SELECT * FROM {source.view} WHERE {quote_ident(entity)} IS NOT NULL")
+        keep = {entity, *(c for c in needed if c)}
+        if spec is not None:
+            keep |= set(_self_reference(spec, schema) or ())
+        if expressions is not None:
+            # A name inside the text may be a column: keeping one too many is harmless.
+            keep |= {c for c in schema if c in expressions}
+        columns = [c for c in schema if c in keep]
+        con.execute(
+            f"CREATE TEMP TABLE ev AS SELECT {', '.join(quote_ident(c) for c in columns)} FROM {source.view} "
+            f"WHERE {quote_ident(entity)} IS NOT NULL"
+        )
     except BaseException:
         con.close()  # never leave the connection open when the copy fails (e.g. out of memory)
         raise
-    return con, schema
+    return con, {c: schema[c] for c in columns}
 
 
 def _safe_expression(expr: str, label: str) -> str:
@@ -186,7 +206,7 @@ def build_category_features(
     """
     try:
         spec = read_spec()
-        con, schema = _open_events(input, entity, [category, measure])
+        con, schema = _open_events(input, entity, [category, measure], spec=spec)
     except (SpecMissingError, SourceNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
     try:
@@ -295,7 +315,7 @@ def build_linked_event_features(
     """
     try:
         spec = read_spec()
-        con, schema = _open_events(input, entity, [category, time_column, reference_column, target_column])
+        con, schema = _open_events(input, entity, [category, time_column, reference_column, target_column], spec=spec)
     except (SpecMissingError, SourceNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
     try:
@@ -348,8 +368,11 @@ def build_linked_event_features(
                 )
         # Responses expected after a sibling: x referred to by A and B -> B referred to by C.
         siblings = con.execute(
-            f"""WITH sib AS (SELECT a.ty AS ta, b.ty AS tb, b.yid AS bid FROM links a JOIN links b
-                             ON a.xid = b.xid AND a.yid <> b.yid AND a.ty <> b.ty),
+            # The sibling side is reduced to (referenced row, type) first: a row referred to by
+            # k rows costs k x types pairs, not k x k.
+            f"""WITH sib AS (SELECT DISTINCT a.ty AS ta, b.ty AS tb, b.yid AS bid
+                             FROM (SELECT DISTINCT xid, ty FROM links) a JOIN links b
+                             ON a.xid = b.xid AND a.ty <> b.ty),
                      ans AS (SELECT DISTINCT s.ta, s.tb, s.bid, c.ty AS tc FROM sib s JOIN links c ON c.xid = s.bid)
                 SELECT a.ta, a.tb, a.tc, count(*) n,
                        (SELECT count(DISTINCT bid) FROM sib s WHERE s.ta = a.ta AND s.tb = a.tb) total
@@ -376,9 +399,10 @@ def build_linked_event_features(
                 formula = f"{rule['type']} rows never referred to by a {rule['expected']} row ({rule['population_share']:.0%} of the population are)"
             else:
                 name = _feature_name("link", rule["type"], "after", rule["sibling"], "without", rule["expected"])
-                sql = f"""SELECT b.ent, count(DISTINCT b.yid) AS k FROM links a JOIN links b
-                          ON a.xid = b.xid AND a.ty = '{sql_escape(rule["sibling"])}' AND b.ty = '{sql_escape(rule["type"])}'
-                          WHERE NOT EXISTS (SELECT 1 FROM links c WHERE c.xid = b.yid AND c.ty = '{sql_escape(rule["expected"])}')
+                sql = f"""SELECT b.ent, count(DISTINCT b.yid) AS k FROM links b
+                          WHERE b.ty = '{sql_escape(rule["type"])}'
+                          AND EXISTS (SELECT 1 FROM links a WHERE a.xid = b.xid AND a.ty = '{sql_escape(rule["sibling"])}')
+                          AND NOT EXISTS (SELECT 1 FROM links c WHERE c.xid = b.yid AND c.ty = '{sql_escape(rule["expected"])}')
                           GROUP BY 1"""
                 formula = (
                     f"{rule['type']} rows whose origin also has a {rule['sibling']} row, never referred to by a "
@@ -460,7 +484,7 @@ def build_sequence_features(
     """
     try:
         spec = read_spec()
-        con, schema = _open_events(input, entity, [category, time_column])
+        con, schema = _open_events(input, entity, [category, time_column], spec=spec)
     except (SpecMissingError, SourceNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
     try:
@@ -577,7 +601,7 @@ def build_conformity_features(
         obs = _safe_expression(observed, "observed")
         exp = _safe_expression(expected, "expected")
         cond = _safe_expression(where, "where") if where else "TRUE"
-        con, schema = _open_events(input, entity, [])
+        con, schema = _open_events(input, entity, [], spec=spec, expressions=f"{obs} {exp} {cond}")
     except (SpecMissingError, SourceNotFoundError, ValueError, SQLRejectedError) as exc:
         return ToolResult.error(str(exc))
     try:
@@ -679,43 +703,50 @@ def build_interaction_graph(input: str, entity: str, counterpart_column: str, fe
         counterpart_column: Column holding the other party (same kind of values as `entity`).
         features: Feature table to extend.
     """
-    import networkx as nx
-
     try:
         con, _ = _open_events(input, entity, [counterpart_column])
     except (SourceNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
     try:
         e, cp = quote_ident(entity), quote_ident(counterpart_column)
-        edges = con.execute(
-            f"SELECT DISTINCT least(CAST({e} AS VARCHAR), CAST({cp} AS VARCHAR)) a, "
+        con.execute(
+            f"CREATE TEMP TABLE edges AS SELECT DISTINCT least(CAST({e} AS VARCHAR), CAST({cp} AS VARCHAR)) a, "
             f"greatest(CAST({e} AS VARCHAR), CAST({cp} AS VARCHAR)) b FROM ev "
             f"WHERE {cp} IS NOT NULL AND CAST({cp} AS VARCHAR) IN (SELECT DISTINCT CAST({e} AS VARCHAR) FROM ev) "
             f"AND CAST({cp} AS VARCHAR) <> CAST({e} AS VARCHAR)"
-        ).fetchall()
+        )
+        n_edges = con.execute("SELECT count(*) FROM edges").fetchall()[0][0]
+        if n_edges > _MAX_GRAPH_EDGES:
+            return ToolResult.error(
+                f"{n_edges} distinct pairs of entities: too many for a graph (limit {_MAX_GRAPH_EDGES}). "
+                "Filter the events first (e.g. one type of exchange)."
+            )
+        # Partner counts in SQL: each pair is stored once (a < b), so both directions are listed.
+        con.execute(
+            "CREATE TEMP TABLE adj AS SELECT a AS n, b AS p FROM edges UNION ALL SELECT b AS n, a AS p FROM edges"
+        )
+        con.execute("CREATE TEMP TABLE deg AS SELECT n, count(*) AS k FROM adj GROUP BY n")
+        node_stats = con.execute(
+            "SELECT adj.n AS node, any_value(mine.k) AS partners, max(d.k) AS degree_max, "
+            "sum(d.k) / count(*) AS degree_mean FROM adj JOIN deg d ON adj.p = d.n JOIN deg mine ON adj.n = mine.n "
+            "GROUP BY adj.n"
+        ).df()
+        pairs = con.execute("SELECT a AS src, b AS dst FROM edges").df()
         entities = con.execute(f"SELECT DISTINCT {e} FROM ev").df()[entity]
     finally:
         con.close()
-    graph = nx.Graph()
-    graph.add_edges_from(edges)
-    size = {n: len(c) for c in nx.connected_components(graph) for n in c}
-    rows = []
-    for node in entities:
-        key = str(node)
-        if key in graph:
-            partners = [graph.degree(p) for p in graph.neighbors(key)]
-            rows.append((node, graph.degree(key), size[key], max(partners), sum(partners) / len(partners)))
-        else:
-            rows.append((node, 0, 1, 0, 0.0))
+    components = component_table(pairs, "node")
+    del pairs
+    stats = node_stats.merge(components[["node", "group_size"]], on="node", how="left").set_index("node")
+    keys = entities.astype(str)
     new = pd.DataFrame(
-        rows,
-        columns=[
-            entity,
-            "igraph_partners",
-            "igraph_component_size",
-            "igraph_partner_degree_max",
-            "igraph_partner_degree_mean",
-        ],
+        {
+            entity: entities.to_numpy(),
+            "igraph_partners": keys.map(stats["partners"]).fillna(0).astype(int).to_numpy(),
+            "igraph_component_size": keys.map(stats["group_size"]).fillna(1).astype(int).to_numpy(),
+            "igraph_partner_degree_max": keys.map(stats["degree_max"]).fillna(0).astype(int).to_numpy(),
+            "igraph_partner_degree_mean": keys.map(stats["degree_mean"]).fillna(0.0).astype(float).to_numpy(),
+        }
     )
     entries = [
         {"name": n, "source": counterpart_column, "template": "interaction_graph", "formula": f}
@@ -730,14 +761,13 @@ def build_interaction_graph(input: str, entity: str, counterpart_column: str, fe
         table = _extend(features, entity, new, entries, [input], fill=0.0)
     except (ArtifactNotFoundError, FileNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
-    sizes = sorted((len(c) for c in nx.connected_components(graph)), reverse=True)
-    degrees = sorted((d for _, d in graph.degree()), reverse=True)
+    sizes = components.drop_duplicates("group")["group_size"]
     return _result(
         entity,
         table,
         entries,
-        nodes=graph.number_of_nodes(),
-        edges=graph.number_of_edges(),
-        largest_components=sizes[:6],
-        largest_degrees=degrees[:6],
+        nodes=len(stats),
+        edges=int(n_edges),
+        largest_components=sizes.head(6).tolist(),
+        largest_degrees=stats["partners"].sort_values(ascending=False).head(6).astype(int).tolist(),
     )

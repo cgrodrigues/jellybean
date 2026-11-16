@@ -22,11 +22,12 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from pydantic import Field
 
 from jellybean.runtime.context import current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError
+from jellybean.skills._shared.artifacts import TABLE_ROW_GROUP, ArtifactNotFoundError
 from jellybean.skills._shared.catalog import (
     SourceNotFoundError,
     connect,
@@ -36,6 +37,7 @@ from jellybean.skills._shared.catalog import (
     sql_escape,
 )
 from jellybean.skills._shared.column_stats import describe
+from jellybean.skills._shared.detection import component_table
 from jellybean.skills._shared.spec_tools import SpecMissingError, patch_spec, read_spec
 from jellybean.skills.feature_engineer._common import (
     _entity_of,
@@ -57,6 +59,8 @@ Template = Literal["measure", "category", "timestamp", "counterparty"]
 Window = Literal["all", "day"]
 _MAX_CATEGORY_LEVELS = 30
 _MAX_SHARE_LEVELS = 15
+_SCALE_CHUNK = 16  # columns of the feature table scaled at a time
+_MAX_GRAPH_EDGES = 50_000_000  # pairs of linked entities a graph can hold in memory
 _ATTRIBUTE_CONSTANCY = 0.99  # share of entities where a column is constant -> attribute
 
 
@@ -104,7 +108,12 @@ def build_entity_features(
         candidates = [c for c in schema if c not in {entity, time_column} | partitions | grain]
         types = _semantic_types(spec, con, source.view, candidates)
         e, view = quote_ident(entity), source.view
-        con.execute(f"CREATE TEMP TABLE ev AS SELECT * FROM {view} WHERE {e} IS NOT NULL")
+        # Only the columns the aggregations read are copied (not grain, partition or unused columns).
+        used = [entity, *([time_column] if time_column else []), *candidates]
+        con.execute(
+            f"CREATE TEMP TABLE ev AS SELECT {', '.join(quote_ident(c) for c in used)} FROM {view} "
+            f"WHERE {e} IS NOT NULL"
+        )
 
         # Attributes: columns constant within (almost) every entity.
         attr_candidates = [c for c in candidates if types[c] in ("category", "boolean", "measure", "timestamp")]
@@ -402,6 +411,63 @@ def build_entity_features(
 # --------------------------------------------------------------------------- #
 # build_graph                                                                 #
 # --------------------------------------------------------------------------- #
+def _graph_nodes(edges: pd.DataFrame, all_entities: pd.Series, entity: str) -> tuple[pd.DataFrame, list[int]]:
+    """Node features of an undirected weighted edge list (one row per pair), and the component sizes.
+
+    Computed on sparse matrices of integer codes (no graph library, no Python
+    loop over the entities): degree, weighted degree, component size and id, and
+    the local clustering coefficient (triangles through the node / pairs of neighbours).
+    """
+    from scipy.sparse import coo_matrix
+
+    columns = [
+        entity,
+        "graph_degree",
+        "graph_weighted_degree",
+        "graph_component_size",
+        "graph_component_id",
+        "graph_clustering",
+    ]
+    if edges.empty:
+        nodes = pd.DataFrame({entity: all_entities.to_numpy()})
+        return nodes.assign(**dict(zip(columns[1:], (0, 0, 1, 0, 0.0), strict=True)))[columns], []
+    codes, names = pd.factorize(pd.concat([edges["src"], edges["dst"]], ignore_index=True))
+    src, dst, n = codes[: len(edges)], codes[len(edges) :], len(names)
+    one = np.ones(len(edges), dtype=np.int64)
+    adjacency = (coo_matrix((one, (src, dst)), shape=(n, n)) + coo_matrix((one, (dst, src)), shape=(n, n))).tocsr()
+    degree = np.asarray(adjacency.sum(axis=1)).ravel()
+    weight = edges["weight"].to_numpy()
+    weighted = np.bincount(src, weights=weight, minlength=n) + np.bincount(dst, weights=weight, minlength=n)
+    if pd.api.types.is_integer_dtype(edges["weight"]):
+        weighted = weighted.astype(np.int64)
+    # Twice the triangles through each node: walks of length 2 that end on a neighbour.
+    twice_triangles = np.asarray((adjacency @ adjacency).multiply(adjacency).sum(axis=1)).ravel()
+    pairs = degree * (degree - 1)
+    clustering = np.divide(twice_triangles, pairs, out=np.zeros(n), where=pairs > 0)
+    components = component_table(edges, "node", tie="text").set_index("node")
+    stats = pd.DataFrame(
+        {
+            "graph_degree": degree,
+            "graph_weighted_degree": weighted,
+            "graph_component_size": components["group_size"].reindex(names).to_numpy(),
+            "graph_component_id": components["group"].reindex(names).to_numpy(),
+            "graph_clustering": clustering,
+        },
+        index=pd.Index(names),
+    )
+    nodes = stats.reindex(all_entities.to_numpy())
+    linked = nodes["graph_degree"].notna().to_numpy()
+    nodes = nodes.fillna({"graph_degree": 0, "graph_weighted_degree": 0, "graph_component_size": 1})
+    nodes = nodes.fillna({"graph_component_id": 0, "graph_clustering": 0.0})
+    for column in ("graph_degree", "graph_component_size", "graph_component_id"):
+        nodes[column] = nodes[column].astype(int)
+    if pd.api.types.is_integer_dtype(edges["weight"]) or not linked.any():
+        nodes["graph_weighted_degree"] = nodes["graph_weighted_degree"].astype(int)
+    nodes.insert(0, entity, all_entities.to_numpy())
+    sizes = components.drop_duplicates("group")["group_size"].tolist()
+    return nodes.reset_index(drop=True)[columns], sizes
+
+
 @tool
 def build_graph(
     input: str,
@@ -424,8 +490,6 @@ def build_graph(
         max_entities_per_value: Ignore values shared by more entities than this.
         features: Optional feature table to extend with the graph features.
     """
-    import networkx as nx
-
     try:
         source = resolve_source(input)
     except SourceNotFoundError as exc:
@@ -467,42 +531,18 @@ def build_graph(
             f"CREATE TEMP TABLE edges AS SELECT src, dst, sum(w) AS weight FROM ({' UNION ALL '.join(parts)}) "
             "GROUP BY 1, 2 ORDER BY 1, 2"
         )
+        n_edges = con.execute("SELECT count(*) FROM edges").fetchall()[0][0]
+        if n_edges > _MAX_GRAPH_EDGES:
+            return ToolResult.error(
+                f"{n_edges} pairs of entities share a value: too many for a graph (limit {_MAX_GRAPH_EDGES}). "
+                "Lower max_entities_per_value or use more specific link columns."
+            )
         edges = con.execute("SELECT src, dst, weight FROM edges").df()
         all_entities = con.execute(f"SELECT DISTINCT {e} FROM {source.view} WHERE {e} IS NOT NULL").df()[entity]
     finally:
         con.close()
 
-    graph = nx.Graph()
-    graph.add_weighted_edges_from(edges.itertuples(index=False, name=None))
-    components = sorted(nx.connected_components(graph), key=lambda c: (-len(c), min(map(str, c))))
-    comp_of = {node: idx + 1 for idx, comp in enumerate(components) for node in comp}
-    clustering = nx.clustering(graph) if graph.number_of_nodes() else {}
-    rows = []
-    for node in all_entities:
-        if node in graph:
-            rows.append(
-                (
-                    node,
-                    graph.degree(node),
-                    graph.degree(node, weight="weight"),
-                    len(components[comp_of[node] - 1]),
-                    comp_of[node],
-                    clustering.get(node, 0.0),
-                )
-            )
-        else:
-            rows.append((node, 0, 0, 1, 0, 0.0))
-    nodes = pd.DataFrame(
-        rows,
-        columns=[
-            entity,
-            "graph_degree",
-            "graph_weighted_degree",
-            "graph_component_size",
-            "graph_component_id",
-            "graph_clustering",
-        ],
-    )
+    nodes, sizes = _graph_nodes(edges, all_entities, entity)
     edge_record = store.save_dataframe(
         "graph_edges",
         edges,
@@ -542,12 +582,11 @@ def build_graph(
         except (ArtifactNotFoundError, FileNotFoundError) as exc:
             return ToolResult.error(f"Unknown feature table: {exc}")
     patch_spec(patch)
-    sizes = [len(c) for c in components]
     return ToolResult.ok(
         {
-            "nodes_with_links": graph.number_of_nodes(),
-            "edges": graph.number_of_edges(),
-            "components": len(components),
+            "nodes_with_links": int((nodes["graph_degree"] > 0).sum()),
+            "edges": len(edges),
+            "components": len(sizes),
             "largest_components": sizes[:8],
             "components_size_3_plus": sum(1 for s in sizes if s >= 3),
             "link_columns": link_stats,
@@ -561,6 +600,95 @@ def build_graph(
 # --------------------------------------------------------------------------- #
 # scale_encode / reduce_dimensions / feature_summary                          #
 # --------------------------------------------------------------------------- #
+def _is_number(series: pd.Series) -> bool:
+    """Numeric or boolean column, including pandas' nullable types."""
+    return pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series)
+
+
+def _scale_block(block: pd.DataFrame, strategy: str, out: dict[str, Any], meta: dict[str, Any]) -> None:
+    """Scale the numeric columns of ``block`` into ``out`` (arrays); record what was done in ``meta``."""
+    for c in list(block.columns):
+        col = block.pop(c).astype(float)
+        nulls = int(col.isna().sum())
+        if nulls:
+            meta["imputed"][c] = nulls
+            col = col.fillna(col.median()).fillna(0.0)
+        if col.nunique() <= 1:
+            meta["dropped_constant"].append(c)
+            continue
+        if strategy == "robust_log" and col.min() >= 0 and col.skew() > 1:
+            col = np.log1p(col)
+            meta["log_transformed"].append(c)
+        if strategy in ("robust", "robust_log"):
+            mid, spread = col.median(), col.quantile(0.75) - col.quantile(0.25)
+            if not spread > 0:
+                spread = col.std()
+        elif strategy == "standard":
+            mid, spread = col.mean(), col.std()
+        else:
+            mid, spread = col.min(), col.max() - col.min()
+        if spread == 0:
+            spread = 1.0
+        meta["center"][c], meta["scale"][c] = mid, spread
+        out[c] = ((col - mid) / spread).to_numpy()
+
+
+def _encode_block(block: pd.DataFrame, out: dict[str, Any]) -> None:
+    """One-hot encode the attribute columns of ``block`` (the 20 most frequent values, the rest as "other")."""
+    for c in list(block.columns):
+        values = block.pop(c).astype("string").fillna("__missing__")
+        top = values.value_counts().index[:20]
+        values = values.where(values.isin(top), "__other__")
+        dummies = pd.get_dummies(values, prefix=c, dtype=float)
+        for name in dummies.columns:
+            out[_feature_name(name)] = dummies[name].to_numpy()
+
+
+def _new_scaling_meta() -> dict[str, Any]:
+    return {"imputed": {}, "dropped_constant": [], "log_transformed": [], "center": {}, "scale": {}, "numeric": 0}
+
+
+def _scale_file(path: Any, entity: str, strategy: str) -> tuple[pd.Series, dict[str, Any], dict[str, Any]]:
+    """Scaled numeric columns and one-hot attribute columns of a feature table file, as arrays.
+
+    Returns the entity ids, {output column: array} (numeric columns first) and
+    what was done (imputed nulls, dropped constants, log-transformed columns,
+    centre and scale). Every column is scaled on its own and the file is read a
+    few columns at a time, so the raw table is never in memory: the peak is the
+    scaled output plus one block of columns.
+    """
+    names = [c for c in pq.read_schema(path).names if c != entity]
+    ids = pd.read_parquet(path, columns=[entity])[entity]
+    out: dict[str, Any] = {}
+    meta = _new_scaling_meta()
+    attributes: list[str] = []
+    for start in range(0, len(names), _SCALE_CHUNK):
+        block = pd.read_parquet(path, columns=names[start : start + _SCALE_CHUNK])
+        other = [c for c in block.columns if not _is_number(block[c])]
+        attributes += other
+        _scale_block(block.drop(columns=other), strategy, out, meta)
+    meta["numeric"] = len(out)
+    for start in range(0, len(attributes), _SCALE_CHUNK):
+        _encode_block(pd.read_parquet(path, columns=attributes[start : start + _SCALE_CHUNK]), out)
+    return ids, out, meta
+
+
+def _save_columns(
+    prefix: str, ids: pd.Series, columns: dict[str, np.ndarray], parents: list[str], params: dict[str, Any]
+) -> Any:
+    """Save a table given as an id column and float arrays, without assembling a DataFrame first."""
+    import pyarrow as pa
+
+    def write(path: Any) -> int:
+        table = pa.Table.from_pandas(ids.reset_index(drop=True).to_frame(), preserve_index=False)
+        for name, values in columns.items():
+            table = table.append_column(name, pa.array(values))
+        pq.write_table(table.replace_schema_metadata(None), path, row_group_size=TABLE_ROW_GROUP)
+        return table.num_rows
+
+    return _store().create(prefix, "table", write, parents=parents, params=params)
+
+
 @tool
 def scale_encode(
     features: str, strategy: Literal["robust_log", "robust", "standard", "minmax"] = "robust_log"
@@ -577,67 +705,34 @@ def scale_encode(
     """
     try:
         entity = _entity_of(features)
-        df = _load_table(features)
+        path = _store().path_of(features)
+        ids, out, meta = _scale_file(path, entity, strategy)
     except (ArtifactNotFoundError, FileNotFoundError, ValueError) as exc:
         return ToolResult.error(str(exc))
-    ids = df[entity]
-    numeric = df.drop(columns=[entity]).select_dtypes(include=["number", "bool"]).astype(float)
-    categorical = df.drop(columns=[entity]).select_dtypes(exclude=["number", "bool"])
-    imputed = {c: int(numeric[c].isna().sum()) for c in numeric.columns if numeric[c].isna().any()}
-    numeric = numeric.fillna(numeric.median(numeric_only=True)).fillna(0.0)
-    constant = [c for c in numeric.columns if numeric[c].nunique() <= 1]
-    numeric = numeric.drop(columns=constant)
-    log_cols = []
-    if strategy == "robust_log":
-        for c in numeric.columns:
-            col = numeric[c]
-            if col.min() >= 0 and col.skew() > 1:
-                numeric[c] = np.log1p(col)
-                log_cols.append(c)
-    if strategy in ("robust", "robust_log"):
-        center = numeric.median()
-        scale = numeric.quantile(0.75) - numeric.quantile(0.25)
-        scale = scale.where(scale > 0, numeric.std()).replace(0, 1.0)
-    elif strategy == "standard":
-        center, scale = numeric.mean(), numeric.std().replace(0, 1.0)
-    else:
-        center, scale = numeric.min(), (numeric.max() - numeric.min()).replace(0, 1.0)
-    scaled = (numeric - center) / scale
-    encoded = []
-    for c in categorical.columns:
-        values = categorical[c].astype("string").fillna("__missing__")
-        top = values.value_counts().index[:20]
-        values = values.where(values.isin(top), "__other__")
-        dummies = pd.get_dummies(values, prefix=c, dtype=float)
-        dummies.columns = [_feature_name(col) for col in dummies.columns]
-        encoded.append(dummies)
-    out = pd.concat(
-        [ids.reset_index(drop=True), scaled.reset_index(drop=True), *[d.reset_index(drop=True) for d in encoded]],
-        axis=1,
-    )
-    store = _store()
-    record = store.save_dataframe(
+    n_rows = len(ids)
+    record = _save_columns(
         "features_scaled",
+        ids,
         out,
         parents=[features],
         params={
             "entity": entity,
             "strategy": strategy,
-            "log_transformed": log_cols,
-            "dropped_constant": constant,
-            "center": center.round(6).to_dict(),
-            "scale": scale.round(6).to_dict(),
+            "log_transformed": meta["log_transformed"],
+            "dropped_constant": meta["dropped_constant"],
+            "center": pd.Series(meta["center"], dtype=float).round(6).to_dict(),
+            "scale": pd.Series(meta["scale"], dtype=float).round(6).to_dict(),
         },
     )
     patch_spec({"features": {"scaled": record.id, "embedding": None}})
     return ToolResult.ok(
         {
-            "entities": len(out),
-            "numeric_features": scaled.shape[1],
-            "one_hot_columns": sum(d.shape[1] for d in encoded),
-            "log_transformed": len(log_cols),
-            "dropped_constant": constant,
-            "imputed_nulls": imputed,
+            "entities": n_rows,
+            "numeric_features": meta["numeric"],
+            "one_hot_columns": len(out) - meta["numeric"],
+            "log_transformed": len(meta["log_transformed"]),
+            "dropped_constant": meta["dropped_constant"],
+            "imputed_nulls": meta["imputed"],
         },
         artifact_id=record.id,
     )
@@ -689,7 +784,15 @@ def reduce_dimensions(
             import umap
         except ImportError:
             return ToolResult.error("UMAP is not installed: run `uv sync --extra explain` or use method 'pca'.")
-        Z = umap.UMAP(n_components=k, random_state=seed).fit_transform(X)
+        cap = current_run().settings.config.detection.fit_max_rows
+        if len(X) <= cap:
+            Z = umap.UMAP(n_components=k, random_state=seed).fit_transform(X)
+        else:
+            # UMAP on millions of rows does not finish: fit on a seeded sample, project the rest.
+            chosen = np.sort(np.random.default_rng(seed).choice(len(X), cap, replace=False))
+            model = umap.UMAP(n_components=k, random_state=seed).fit(X[chosen])
+            Z = np.vstack([model.transform(X[start : start + 100_000]) for start in range(0, len(X), 100_000)])
+            summary["fitted_on_sample"] = cap
     out = pd.DataFrame(Z, columns=[f"c{i + 1}" for i in range(k)])
     out.insert(0, entity, df[entity].to_numpy())
     store = _store()

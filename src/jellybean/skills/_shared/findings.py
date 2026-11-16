@@ -16,13 +16,19 @@ import json
 import os
 import re
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field
 
+from jellybean.runtime.cancellation import check_cancelled
 from jellybean.runtime.context import RunContext, current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
 from jellybean.skills._shared.artifacts import ArtifactStore
@@ -131,17 +137,76 @@ def finding_entities(finding: Finding, ctx: RunContext | None = None) -> pd.Data
 # --------------------------------------------------------------------------- #
 # Feature tables                                                              #
 # --------------------------------------------------------------------------- #
-def feature_tables(ctx: RunContext | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """(raw feature table, scaled feature table, entity column) recorded in the spec."""
+@dataclass(frozen=True)
+class FeatureSource:
+    """Where the feature tables of the run are, without loading them."""
+
+    raw_path: Path
+    scaled_path: Path
+    entity: str
+
+    def columns(self, which: Literal["raw", "scaled"] = "raw") -> list[str]:
+        return list(pq.read_schema(self.raw_path if which == "raw" else self.scaled_path).names)
+
+    def n_rows(self) -> int:
+        return int(pq.read_metadata(self.raw_path).num_rows)
+
+
+def feature_source(ctx: RunContext | None = None) -> FeatureSource:
+    """Paths of the raw and scaled feature tables recorded in the spec, and the entity column."""
     ctx = ctx or current_run()
     spec = read_spec(ctx)
     if not spec.features.table or not spec.features.scaled or not spec.entity:
         raise SpecMissingError("Feature tables are missing in the spec: run the feature engineer first.")
     store = ArtifactStore(ctx)
-    raw = pd.read_parquet(store.path_of(spec.features.table))
-    scaled = pd.read_parquet(store.path_of(spec.features.scaled))
     entity = store.get(spec.features.scaled).params.get("entity") or spec.entity.column
-    return raw, scaled, entity
+    return FeatureSource(store.path_of(spec.features.table), store.path_of(spec.features.scaled), entity)
+
+
+def read_features(
+    path: Path, entity: str, columns: list[str] | None = None, members: Iterable[Any] | None = None
+) -> pd.DataFrame:
+    """Rows of a feature table, in file order: only ``columns`` and, with ``members``, only those entities.
+
+    Both filters are applied while reading, so a group of a few entities costs
+    little memory whatever the size of the table.
+    """
+    if columns is not None:
+        columns = list(dict.fromkeys(columns))
+    if members is None:
+        return pd.read_parquet(path, columns=columns)
+    wanted = pd.Index(list(members))
+    file = pq.ParquetFile(path)
+
+    def matching(as_text: bool) -> list[pa.Table]:
+        # One row group at a time: its ids first, then the wanted rows of the groups that have any.
+        chosen = pd.Index([str(m) for m in wanted]) if as_text else wanted
+        pieces = []
+        for group in range(file.num_row_groups):
+            check_cancelled()
+            ids = file.read_row_group(group, columns=[entity]).column(entity).to_pandas()
+            keep = np.flatnonzero((ids.astype(str) if as_text else ids).isin(chosen).to_numpy())
+            if len(keep):
+                pieces.append(file.read_row_group(group, columns=columns).take(keep))
+        return pieces
+
+    pieces = matching(as_text=False) if len(wanted) else []
+    if not pieces and len(wanted):
+        pieces = matching(as_text=True)  # ids whose type does not match the stored column
+    if not pieces:
+        empty = file.schema_arrow.empty_table()
+        pieces = [empty.select(columns) if columns is not None else empty]
+    return pa.concat_tables(pieces).to_pandas().reset_index(drop=True)
+
+
+def feature_tables(ctx: RunContext | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """(raw feature table, scaled feature table, entity column), both loaded in full.
+
+    Costly on large populations: prefer :func:`feature_source` with
+    :func:`read_features`, :func:`group_effect_sizes` or :func:`group_signature`.
+    """
+    source = feature_source(ctx)
+    return pd.read_parquet(source.raw_path), pd.read_parquet(source.scaled_path), source.entity
 
 
 def family_columns(columns: list[str], families: list[str] | None, ctx: RunContext | None = None) -> list[str]:
@@ -173,12 +238,103 @@ def numeric_matrix(scaled: pd.DataFrame, entity: str) -> pd.DataFrame:
     return scaled.set_index(entity).select_dtypes(include=["number", "bool"]).astype(float)
 
 
+_COLUMN_CHUNK = 16  # columns of a feature table read at a time
+
+
+def numeric_columns(path: Path, entity: str) -> list[str]:
+    """Numeric and boolean columns of a feature table file (the columns of :func:`numeric_matrix`)."""
+    types = pa.types
+    return [
+        f.name
+        for f in pq.read_schema(path)
+        if f.name != entity and (types.is_integer(f.type) or types.is_floating(f.type) or types.is_boolean(f.type))
+    ]
+
+
+def read_numeric_matrix(
+    path: Path, entity: str, columns: list[str] | None = None, members: Iterable[Any] | None = None
+) -> pd.DataFrame:
+    """:func:`numeric_matrix` of a feature table file, reading only the numeric columns (or ``columns`` of them).
+
+    The whole table is filled a few columns at a time into one array, so its
+    peak memory is one copy of the matrix (not the several a DataFrame load makes).
+    """
+    numeric = numeric_columns(path, entity)
+    if columns is not None:
+        wanted = set(columns)
+        numeric = [c for c in numeric if c in wanted]
+    if members is not None:
+        return numeric_matrix(read_features(path, entity, columns=[entity, *numeric], members=members), entity)
+    ids = pd.read_parquet(path, columns=[entity])[entity]
+    matrix = np.empty((len(ids), len(numeric)), dtype=float)
+    for start in range(0, len(numeric), _COLUMN_CHUNK):
+        check_cancelled()
+        names = numeric[start : start + _COLUMN_CHUNK]
+        block = pd.read_parquet(path, columns=names)
+        for offset, name in enumerate(names):
+            matrix[:, start + offset] = block[name].to_numpy(dtype=float, na_value=np.nan)
+    return pd.DataFrame(matrix, index=pd.Index(ids, name=entity), columns=numeric, copy=False)
+
+
+def _is_measure(series: pd.Series) -> bool:
+    return pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
+
+
+def _numeric_stats(pop: pd.Series) -> tuple[float, float] | None:
+    """(median, robust scale) of a population column; None when it is empty."""
+    pop = pop.dropna().astype(float)
+    if pop.empty:
+        return None
+    med = float(pop.median())
+    scale = 1.4826 * float((pop - med).abs().median())
+    if scale == 0:
+        scale = float(pop.std()) or 0.0
+    return med, scale
+
+
+def _shares(series: pd.Series) -> pd.Series:
+    return series.astype("string").fillna("__missing__").value_counts(normalize=True)
+
+
+def _numeric_effect(col: str, grp: pd.Series, stats: tuple[float, float] | None) -> dict[str, Any] | None:
+    grp = grp.dropna().astype(float)
+    if stats is None or grp.empty or stats[1] == 0:
+        return None
+    med_p, scale = stats
+    effect = (float(grp.median()) - med_p) / scale
+    return {
+        "feature": col,
+        "kind": "numeric",
+        "group_median": round(float(grp.median()), 4),
+        "population_median": round(med_p, 4),
+        "effect": round(float(np.clip(effect, -1e3, 1e3)), 3),
+        "direction": "higher" if effect > 0 else "lower",
+    }
+
+
+def _categorical_effect(col: str, g_share: pd.Series, p_share: pd.Series) -> dict[str, Any] | None:
+    diff = (g_share - p_share.reindex(g_share.index).fillna(0)).sort_values(key=abs, ascending=False)
+    if diff.empty:
+        return None
+    value = diff.index[0]
+    return {
+        "feature": col,
+        "kind": "categorical",
+        "value": str(value),
+        "group_share": round(float(g_share[value]), 4),
+        "population_share": round(float(p_share.get(value, 0.0)), 4),
+        "effect": round(float(diff.iloc[0]) * 10, 3),  # share difference x10, comparable scale
+        "direction": "higher" if diff.iloc[0] > 0 else "lower",
+    }
+
+
 def effect_sizes(raw: pd.DataFrame, entity: str, members: set[Any], top: int = 8) -> list[dict[str, Any]]:
     """Features that differ most between a group and the population.
 
     Numeric features: robust effect = (median_group - median_population) / scale,
     with scale = 1.4826 * MAD of the population (std when MAD is 0). Categorical
     attributes: the largest share difference of a value. Sorted by |effect|.
+    The population is every entity outside the group.
     """
     mask = raw[entity].isin(members)
     if not mask.any():
@@ -188,49 +344,87 @@ def effect_sizes(raw: pd.DataFrame, entity: str, members: set[Any], top: int = 8
     for col in raw.columns:
         if col == entity:
             continue
-        series = raw[col]
-        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
-            pop = rest[col].dropna().astype(float)
-            grp = group[col].dropna().astype(float)
-            if pop.empty or grp.empty:
-                continue
-            med_p = float(pop.median())
-            scale = 1.4826 * float((pop - med_p).abs().median())
-            if scale == 0:
-                scale = float(pop.std()) or 0.0
-            if scale == 0:
-                continue
-            effect = (float(grp.median()) - med_p) / scale
-            out.append(
-                {
-                    "feature": col,
-                    "kind": "numeric",
-                    "group_median": round(float(grp.median()), 4),
-                    "population_median": round(med_p, 4),
-                    "effect": round(float(np.clip(effect, -1e3, 1e3)), 3),
-                    "direction": "higher" if effect > 0 else "lower",
-                }
-            )
+        if _is_measure(raw[col]):
+            found = _numeric_effect(col, group[col], _numeric_stats(rest[col]))
         else:
-            g_share = group[col].astype("string").fillna("__missing__").value_counts(normalize=True)
-            p_share = rest[col].astype("string").fillna("__missing__").value_counts(normalize=True)
-            diff = (g_share - p_share.reindex(g_share.index).fillna(0)).sort_values(key=abs, ascending=False)
-            if diff.empty:
-                continue
-            value = diff.index[0]
-            out.append(
-                {
-                    "feature": col,
-                    "kind": "categorical",
-                    "value": str(value),
-                    "group_share": round(float(g_share[value]), 4),
-                    "population_share": round(float(p_share.get(value, 0.0)), 4),
-                    "effect": round(float(diff.iloc[0]) * 10, 3),  # share difference x10, comparable scale
-                    "direction": "higher" if diff.iloc[0] > 0 else "lower",
-                }
-            )
+            found = _categorical_effect(col, _shares(group[col]), _shares(rest[col]))
+        if found:
+            out.append(found)
     out.sort(key=lambda d: -abs(d["effect"]))
     return out[:top]
+
+
+# Population statistics of large feature tables, per file: {column: (median, scale) | shares}.
+_POPULATION_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_POPULATION_CACHE_MAX = 4
+
+
+def clear_population_cache() -> None:
+    _POPULATION_CACHE.clear()
+
+
+def _population_stats(path: Path, entity: str) -> dict[str, Any]:
+    """Median/scale (numeric) or value shares (categorical) of every column, read a few columns at a time."""
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _POPULATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    columns = [c for c in pq.read_schema(path).names if c != entity]
+    stats: dict[str, Any] = {}
+    for start in range(0, len(columns), _COLUMN_CHUNK):
+        check_cancelled()
+        block = pd.read_parquet(path, columns=columns[start : start + _COLUMN_CHUNK])
+        for col in block.columns:
+            stats[col] = _numeric_stats(block[col]) if _is_measure(block[col]) else _shares(block[col])
+    if len(_POPULATION_CACHE) >= _POPULATION_CACHE_MAX:
+        _POPULATION_CACHE.clear()
+    _POPULATION_CACHE[key] = stats
+    return stats
+
+
+def group_effect_sizes(members: set[Any], top: int = 8, ctx: RunContext | None = None) -> list[dict[str, Any]]:
+    """:func:`effect_sizes` of a group against the run's raw feature table, without loading it whole.
+
+    Up to ``detection.exact_population_max_rows`` entities the result is the
+    same as :func:`effect_sizes` (population = every entity outside the group).
+    Above it, the population statistics are computed once per feature table over
+    **all** entities (the group included) and reused for every group; only the
+    group's rows are read.
+    """
+    ctx = ctx or current_run()
+    source = feature_source(ctx)
+    if source.n_rows() <= ctx.settings.config.detection.exact_population_max_rows:
+        return effect_sizes(pd.read_parquet(source.raw_path), source.entity, members, top=top)
+    group = read_features(source.raw_path, source.entity, members=members)
+    if group.empty:
+        return []
+    population = _population_stats(source.raw_path, source.entity)
+    out: list[dict[str, Any]] = []
+    for col in group.columns:
+        if col == source.entity:
+            continue
+        if _is_measure(group[col]):
+            stats = population[col] if isinstance(population[col], tuple) else None
+            found = _numeric_effect(col, group[col], stats)
+        else:
+            found = _categorical_effect(col, _shares(group[col]), population[col])
+        if found:
+            out.append(found)
+    out.sort(key=lambda d: -abs(d["effect"]))
+    return out[:top]
+
+
+def _signature(
+    centroid: pd.Series, top_features: list[dict[str, Any]], rules: list[dict[str, Any]] | None
+) -> dict[str, Any]:
+    return {
+        "dominant_features": [
+            {"feature": f["feature"], "direction": f["direction"], "effect": f["effect"]} for f in top_features[:8]
+        ],
+        "rules": [r.get("rule") for r in (rules or []) if r.get("rule")],
+        "centroid": {k: round(float(v), 4) for k, v in centroid.items() if np.isfinite(v)},
+    }
 
 
 def signature(
@@ -244,14 +438,21 @@ def signature(
     """Pattern signature: dominant features (direction, effect), rules and centroid (scaled space)."""
     top_features = top_features or effect_sizes(raw, entity, members)
     matrix = numeric_matrix(scaled, entity)
-    centroid = matrix[matrix.index.isin(members)].median()
-    return {
-        "dominant_features": [
-            {"feature": f["feature"], "direction": f["direction"], "effect": f["effect"]} for f in top_features[:8]
-        ],
-        "rules": [r.get("rule") for r in (rules or []) if r.get("rule")],
-        "centroid": {k: round(float(v), 4) for k, v in centroid.items() if np.isfinite(v)},
-    }
+    return _signature(matrix[matrix.index.isin(members)].median(), top_features, rules)
+
+
+def group_signature(
+    members: set[Any],
+    top_features: list[dict[str, Any]] | None = None,
+    rules: list[dict[str, Any]] | None = None,
+    ctx: RunContext | None = None,
+) -> dict[str, Any]:
+    """:func:`signature` of a group of the run's feature tables, reading only the group's rows."""
+    ctx = ctx or current_run()
+    source = feature_source(ctx)
+    top_features = top_features or group_effect_sizes(members, ctx=ctx)
+    matrix = numeric_matrix(read_features(source.scaled_path, source.entity, members=members), source.entity)
+    return _signature(matrix.median(), top_features, rules)
 
 
 def signature_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:

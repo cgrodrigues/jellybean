@@ -33,6 +33,9 @@ _ID_RE = re.compile(r"^([a-z][a-z0-9_]{0,60})_v(\d+)$")
 _EXTENSIONS: dict[str, str] = {"table": "parquet", "json": "json", "plot": "png", "text": "md"}
 
 
+TABLE_ROW_GROUP = 100_000  # rows per Parquet row group of the tables written from pandas
+
+
 class ArtifactNotFoundError(KeyError):
     """Raised when an artifact id is not in the manifest."""
 
@@ -237,7 +240,9 @@ class ArtifactStore:
         """Store a (small, per-entity) pandas DataFrame as a Parquet artifact."""
 
         def write(path: Path) -> int:
-            df.to_parquet(path, index=False)
+            # Row groups of a moderate size: a reader that wants a few entities (a finding's
+            # members) then decodes one group at a time, not the whole table.
+            df.to_parquet(path, index=False, row_group_size=TABLE_ROW_GROUP)
             return len(df)
 
         return self.create(prefix, "table", write, parents, params)

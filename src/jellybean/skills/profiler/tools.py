@@ -1327,6 +1327,9 @@ def normalize_key(dataset: str, column: str, strategy: str = "auto", match_again
 # --------------------------------------------------------------------------- #
 # correlation_summary                                                         #
 # --------------------------------------------------------------------------- #
+_DEPENDENCY_BATCH = 8  # pairs of category columns tested per statement in correlation_summary
+
+
 @tool
 def correlation_summary(dataset: str) -> ToolResult:
     """Find redundant columns: strongly correlated measures and functionally dependent categories.
@@ -1356,10 +1359,14 @@ def correlation_summary(dataset: str) -> ToolResult:
             dependencies = []
             cat_pairs = [(a, b) for i, a in enumerate(cats) for b in cats[i + 1 :]]
             if cat_pairs:
-                exprs = ", ".join(
-                    f"count(DISTINCT ({quote_ident(a.name)}, {quote_ident(b.name)}))" for a, b in cat_pairs
-                )
-                counts = con.execute(f"SELECT {exprs} FROM {source.view}").fetchall()[0]
+                # A few pairs per statement: each exact distinct count keeps its values in memory.
+                counts: list[int] = []
+                for start in range(0, len(cat_pairs), _DEPENDENCY_BATCH):
+                    exprs = ", ".join(
+                        f"count(DISTINCT ({quote_ident(a.name)}, {quote_ident(b.name)}))"
+                        for a, b in cat_pairs[start : start + _DEPENDENCY_BATCH]
+                    )
+                    counts += con.execute(f"SELECT {exprs} FROM {source.view}").fetchall()[0]
                 for (a, b), n in zip(cat_pairs, counts, strict=True):
                     if n == a.distinct and n == b.distinct:
                         dependencies.append({"a": a.name, "b": b.name, "relation": "one_to_one"})

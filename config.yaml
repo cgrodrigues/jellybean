@@ -56,6 +56,11 @@ detection:
   cluster_max_rows: 200000         # HDBSCAN is fitted on a seeded sample above this many entities
   group_max_pool: 10000            # most deviating pooled outliers grouped (pairwise distances: n^2 memory)
   plot_max_points: 50000           # population points drawn in a scatter plot (members are always drawn)
+  fit_max_rows: 500000             # above this, outlier models are fitted on a seeded sample and score the rest in batches
+  exact_population_max_rows: 500000  # above this, groups are compared with the whole population's statistics (computed once)
+  surrogate_max_rows: 200000       # non-members sampled to fit the analyst's surrogate rules
+  max_candidates_per_run: 500      # largest groups of one detection run kept before merging
+  graph_max_edges: 2000000         # community detection and centrality refuse graphs with more edges
 
 critic:
   min_stability: 0.6               # a finding below this stability cannot be "confirmed"
