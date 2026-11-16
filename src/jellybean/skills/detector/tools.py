@@ -183,7 +183,7 @@ def run_clustering(
     cfg = _cfg()
     try:
         matrix, entity = _load_matrix(features)
-        labels = cluster_labels(matrix.to_numpy(), method, params or {}, int(seed))
+        labels = cluster_labels(matrix.to_numpy(), method, params or {}, int(seed), max_rows=cfg.cluster_max_rows)
     except (ArtifactNotFoundError, ValueError, DetectionError) as exc:
         return ToolResult.error(str(exc))
     sizes = pd.Series(labels).value_counts()
@@ -523,7 +523,11 @@ def run_contextual_outliers(
 # consolidate_findings                                                        #
 # --------------------------------------------------------------------------- #
 def _group_entities(matrix: pd.DataFrame, pool: list[Any], distance: float, min_size: int) -> list[list[Any]]:
-    """Group pooled entities by the direction of their deviation (cosine, average linkage)."""
+    """Group pooled entities by the direction of their deviation (cosine, average linkage).
+
+    The grouping keeps a distance for every pair of entities: above
+    ``detection.group_max_pool`` only the most deviating entities are grouped.
+    """
     if len(pool) < min_size:
         return []
     from sklearn.cluster import AgglomerativeClustering
@@ -531,6 +535,10 @@ def _group_entities(matrix: pd.DataFrame, pool: list[Any], distance: float, min_
     X = matrix.loc[pool].clip(-20, 20).to_numpy()
     norms = np.linalg.norm(X, axis=1)
     keep = norms > 0
+    cap = _cfg().group_max_pool
+    if int(keep.sum()) > cap:
+        # Stable choice: the `cap` largest deviations (ties broken by position).
+        keep &= np.isin(np.arange(len(pool)), np.argsort(-norms, kind="stable")[:cap])
     X, members = X[keep] / norms[keep, None], [p for p, k in zip(pool, keep, strict=True) if k]
     if len(members) < 2:
         return []

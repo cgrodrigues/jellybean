@@ -357,6 +357,8 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         log.append(
             {"op_id": op_id, "op": op.op, "rows_before": before, "rows_after": after, "affected_rows": int(affected)}
         )
+        # The previous step is no longer needed: keep one copy of the data, not one per operation.
+        con.execute(f"DROP TABLE IF EXISTS {prev}")
 
     final = f"s{len(ops)}"
     if needs_file:
@@ -782,11 +784,12 @@ def materialize_join(join_index: int = 0, left_artifact: str | None = None) -> T
         )
         key_names = ", ".join(f"__k{i}" for i in range(len(join.keys)))
         dup = con.execute(
-            f"SELECT {key_names} FROM (SELECT {rk} FROM {right.view}) GROUP BY {key_names} HAVING count(*) > 1"
-        ).fetchall()
+            f"SELECT count(*) FROM (SELECT {key_names} FROM (SELECT {rk} FROM {right.view}) "
+            f"GROUP BY {key_names} HAVING count(*) > 1)"
+        ).fetchall()[0][0]
         if dup:
             return ToolResult.error(
-                f"The right side still has {len(dup)} duplicated keys: dedupe it first "
+                f"The right side still has {dup} duplicated keys: dedupe it first "
                 "(the join must not create extra rows)."
             )
         flag = f"matched_{join.right}"

@@ -80,6 +80,20 @@ pattern-registry thresholds, detection and critic thresholds, and PII masking
 patterns. Defaults live in [src/jellybean/settings.py](src/jellybean/settings.py),
 so the file is optional.
 
+**Resources.** Three groups of settings keep a run within the machine:
+
+- `limits.duckdb_memory_limit`, `duckdb_threads`, `duckdb_max_temp_size`: every
+  DuckDB connection has a memory and thread limit and spills to
+  `workspace/<run_id>/tmp` above it.
+- `limits.tool_timeout_s`: at the timeout the tool's queries are interrupted and
+  the tool is stopped. Ctrl+C does the same and returns the prompt.
+- `profiling.*` and the size caps in `detection.*` (`cluster_max_rows`,
+  `group_max_pool`, `plot_max_points`): above these sizes a step samples, or
+  approximates, and says so in a warning.
+
+What is still expensive on large data is listed in
+[docs/performance-audit.md](docs/performance-audit.md).
+
 ## Dataset notes (README.md per dataset)
 
 A dataset folder may contain a `README.md` with human context: what each
@@ -282,8 +296,11 @@ Each run writes `workspace/<run_id>/`: `spec.yaml`, `manifest.json`,
 `artifacts/`, `findings/`, `run.duckdb`, `logs/trace.jsonl`, `report.md`,
 `run_result.json` and (after `evaluate`) `evaluation.json`. The trace has one
 line per LLM call (tokens, cache reads, duration) and per tool call
-(arguments, output size, raw rows, duration). Data values are never written to
-it.
+(arguments, output size, raw rows, duration). Tool outputs are never written to
+it. A failed call also records its error message (cut, with values that look
+like personal data masked), and the console prints that message under the
+failed call. The full traceback of an unexpected error goes to
+`logs/errors.log`.
 
 **Cost.** A full run with Claude Haiku uses on the order of 1M tokens, most of
 them in the per-finding critique. Prompt caching (`llm.prompt_caching`, on by
@@ -593,13 +610,14 @@ uv run ruff check . && uv run ruff format --check .
 │   ├── evaluation.py             # comparison with the ground truth
 │   ├── runtime/
 │   │   ├── context.py            # active run (run id, folders, seed)
-│   │   ├── tool_registry.py      # @tool decorator, ToolResult, schemas, ToolRegistry
+│   │   ├── tool_registry.py      # @tool decorator, ToolResult, schemas, timeouts, ToolRegistry
+│   │   ├── cancellation.py       # stops a tool call: interrupts its DuckDB queries
 │   │   ├── skill_loader.py       # SKILL.md -> agent definitions
 │   │   ├── agent_runner.py       # tool-use loop, Runtime, delegation, token budget
 │   │   ├── llm_client.py         # LLMClient, LangChain providers, prompt caching, FakeLLM
 │   │   ├── human.py              # console / auto-approve / scripted answers
 │   │   ├── progress.py           # live progress view (trace listener)
-│   │   └── tracing.py            # logs/trace.jsonl
+│   │   └── tracing.py            # logs/trace.jsonl, logs/errors.log
 │   ├── skills/
 │   │   ├── _shared/              # data tools, artifacts, catalog/sandbox, SQL guard, masking,
 │   │   │                         # column stats, keys, spec tools, findings, detection, registry

@@ -136,7 +136,14 @@ def _redetect(finding: Finding, sample: set[Any], seed: int) -> set[Any]:
             matrix, _ = _matrix(p["features"])
             sub = matrix[matrix.index.isin(sample)]
             labels = pd.Series(
-                cluster_labels(sub.to_numpy(), p["method"], p.get("method_params", {}), seed), index=sub.index
+                cluster_labels(
+                    sub.to_numpy(),
+                    p["method"],
+                    p.get("method_params", {}),
+                    seed,
+                    max_rows=_config().detection.cluster_max_rows,
+                ),
+                index=sub.index,
             )
             # The cluster that best matches the finding's members.
             inside = labels[labels.index.isin(_members(finding))]

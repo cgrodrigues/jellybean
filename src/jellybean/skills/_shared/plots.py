@@ -33,9 +33,9 @@ def projection_2d(ctx: RunContext) -> tuple[pd.DataFrame, str] | None:
     spec = load_spec(ctx.spec_path)
     store = ArtifactStore(ctx)
     if spec.features.embedding:
-        emb = pd.read_parquet(store.path_of(spec.features.embedding))
         entity = store.get(spec.features.embedding).params["entity"]
-        return emb[[entity, "c1", "c2"]].rename(columns={"c1": "x", "c2": "y"}), entity
+        emb = pd.read_parquet(store.path_of(spec.features.embedding), columns=[entity, "c1", "c2"])
+        return emb.rename(columns={"c1": "x", "c2": "y"}), entity
     if spec.features.scaled:
         from sklearn.decomposition import PCA
 
@@ -47,10 +47,51 @@ def projection_2d(ctx: RunContext) -> tuple[pd.DataFrame, str] | None:
     return None
 
 
+def _max_points(ctx: RunContext | None = None) -> int:
+    from jellybean.runtime.context import maybe_current_run
+    from jellybean.settings import get_settings
+
+    ctx = ctx or maybe_current_run()
+    return (ctx.settings if ctx else get_settings()).config.detection.plot_max_points
+
+
+def _thin(index: pd.Index, always: np.ndarray, limit: int, seed: int = 0) -> np.ndarray:
+    """Boolean mask keeping every ``always`` row and a seeded sample of the others, about ``limit`` in all.
+
+    A scatter of millions of points costs memory and time and shows nothing more
+    than a sample of them; the rows that matter (members, small clusters) are all kept.
+    """
+    others = np.flatnonzero(~always)
+    room = max(limit - int(always.sum()), 0)
+    keep = always.copy()
+    if len(others) > room:
+        others = np.random.default_rng(seed).choice(others, size=room, replace=False)
+    keep[others] = True
+    return keep
+
+
 def cluster_map(coords: pd.DataFrame, labels: pd.Series, title: str, small: set[int]) -> plt.Figure:
-    """Scatter of the entities coloured by cluster; noise grey; small clusters highlighted and labelled."""
-    fig, ax = plt.subplots(figsize=(9, 7))
+    """Scatter of the entities coloured by cluster; noise grey; small clusters highlighted and labelled.
+
+    Above ``detection.plot_max_points`` the large clusters and the noise are thinned
+    (the legend keeps the real sizes); small clusters are always drawn in full.
+    """
     sizes = labels.value_counts()
+    shown = _thin(labels.index, labels.isin(small).to_numpy(), _max_points())
+    coords, labels = coords[shown], labels[shown]
+    fig, ax = plt.subplots(figsize=(9, 7))
+    try:
+        _draw_cluster_map(ax, coords, labels, sizes, title, small)
+        fig.tight_layout()
+    except BaseException:
+        plt.close(fig)  # a failed plot must not stay in pyplot's registry
+        raise
+    return fig
+
+
+def _draw_cluster_map(
+    ax: Any, coords: pd.DataFrame, labels: pd.Series, sizes: pd.Series, title: str, small: set[int]
+) -> None:
     noise = labels == -1
     ax.scatter(
         coords.loc[noise, "x"],
@@ -58,7 +99,7 @@ def cluster_map(coords: pd.DataFrame, labels: pd.Series, title: str, small: set[
         s=3,
         color="lightgrey",
         alpha=0.5,
-        label=f"noise ({int(noise.sum()):,})",
+        label=f"noise ({int(sizes.get(-1, 0)):,})",
     )
     for i, (label, size) in enumerate(sizes.drop(index=-1, errors="ignore").items()):
         mask = labels == label
@@ -88,8 +129,6 @@ def cluster_map(coords: pd.DataFrame, labels: pd.Series, title: str, small: set[
     ax.set_title(title + "\n(* small clusters = candidate anomalous groups)", fontsize=10)
     handles, legend_labels = ax.get_legend_handles_labels()
     ax.legend(handles[:16], legend_labels[:16], fontsize=7, loc="best", markerscale=2)
-    fig.tight_layout()
-    return fig
 
 
 def findings_map(ctx: RunContext, findings: list[Finding]) -> plt.Figure | None:
@@ -100,8 +139,24 @@ def findings_map(ctx: RunContext, findings: list[Finding]) -> plt.Figure | None:
         return None
     coords, entity = projection
     coords = coords.set_index(entity)
+    # The population is background: a seeded sample of it is enough. Members are drawn from `coords` in full.
+    background = coords[_thin(coords.index, np.zeros(len(coords), dtype=bool), _max_points(ctx))]
     fig, ax = plt.subplots(figsize=(10, 7.5))
-    ax.scatter(coords["x"], coords["y"], s=2, color="lightgrey", alpha=0.4, label=f"population ({len(coords):,})")
+    try:
+        _draw_findings_map(ax, ctx, coords, background, entity_findings)
+        fig.tight_layout()
+    except BaseException:
+        plt.close(fig)
+        raise
+    return fig
+
+
+def _draw_findings_map(
+    ax: Any, ctx: RunContext, coords: pd.DataFrame, background: pd.DataFrame, entity_findings: list[Finding]
+) -> None:
+    ax.scatter(
+        background["x"], background["y"], s=2, color="lightgrey", alpha=0.4, label=f"population ({len(coords):,})"
+    )
     for i, f in enumerate(entity_findings):
         ids = finding_entities(f, ctx)
         members = coords[coords.index.isin(set(ids[ids.columns[0]]))]
@@ -129,8 +184,6 @@ def findings_map(ctx: RunContext, findings: list[Finding]) -> plt.Figure | None:
     ax.set_ylabel("PCA 2")
     ax.set_title("Findings on the PCA map (o confirmed, x artifact, ^ weak, s unstable)", fontsize=10)
     ax.legend(fontsize=7, loc="best", markerscale=1.5)
-    fig.tight_layout()
-    return fig
 
 
 def save_figure(fig: plt.Figure, path: Path) -> None:

@@ -99,14 +99,26 @@ def low_support(n_events: pd.Series, quantile: float = 0.10) -> pd.Series:
     return (events < 0.5 * float(events.median())) & (events <= float(events.quantile(quantile)))
 
 
-def cluster_labels(X: np.ndarray, method: str, params: dict[str, Any], seed: int) -> np.ndarray:
-    """Cluster label per row (-1 = noise, for HDBSCAN)."""
+def cluster_labels(
+    X: np.ndarray, method: str, params: dict[str, Any], seed: int, max_rows: int | None = None
+) -> np.ndarray:
+    """Cluster label per row (-1 = noise, for HDBSCAN).
+
+    HDBSCAN compares entities pairwise, so above ``max_rows`` it is fitted on a
+    seeded sample of that size; the rows left out get the label -1 (not clustered).
+    """
     if method == "hdbscan":
         from sklearn.cluster import HDBSCAN
 
-        return HDBSCAN(
+        model = HDBSCAN(
             min_cluster_size=int(params.get("min_cluster_size", 10)), min_samples=params.get("min_samples"), copy=True
-        ).fit_predict(X)
+        )
+        if max_rows is not None and len(X) > max_rows:
+            chosen = np.sort(np.random.default_rng(seed).choice(len(X), size=max_rows, replace=False))
+            labels = np.full(len(X), -1, dtype=int)
+            labels[chosen] = model.fit_predict(X[chosen])
+            return labels
+        return model.fit_predict(X)
     if method == "kmeans":
         from sklearn.cluster import KMeans
 

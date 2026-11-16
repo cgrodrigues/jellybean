@@ -80,6 +80,9 @@ class ProfilingConfig(_Section):
     # Above this many rows the integrity checks run on the raw rows instead of a
     # materialised copy of the distinct rows (exact duplicates are then not removed).
     distinct_max_rows: int = Field(5_000_000, ge=0)
+    # Above this many rows column statistics use approximate quantiles, and distinct counts
+    # (still exact) are computed column by column so they spill to disk.
+    exact_stats_max_rows: int = Field(5_000_000, ge=0)
     # Candidate relations are screened on a sample of about this many rows first.
     sample_rows: int = Field(200_000, ge=100)
     # Candidate relations tested per statement (two filtered aggregates each).
@@ -133,6 +136,10 @@ class DetectionConfig(_Section):
     max_family_findings: int = Field(16, ge=0)
     merge_overlap: float = Field(0.8, gt=0, le=1)  # merge when this share of the smaller group is shared
     ts_threshold: float = Field(6.0, gt=0)  # robust z for time-series anomalies
+    # Size caps of the steps whose cost grows faster than the number of entities.
+    cluster_max_rows: int = Field(200_000, ge=1000)  # HDBSCAN is fitted on a seeded sample above this
+    group_max_pool: int = Field(10_000, ge=100)  # pooled outliers grouped by pairwise distance (n^2 memory)
+    plot_max_points: int = Field(50_000, ge=1000)  # population points drawn in a scatter plot
 
 
 class CriticConfig(_Section):

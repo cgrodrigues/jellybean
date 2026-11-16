@@ -12,6 +12,7 @@ Semantic typing uses only the column *name*, its *statistics* and up to five
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -101,44 +102,70 @@ def describe(con: duckdb.DuckDBPyConnection, view: str) -> list[tuple[str, str]]
     return [(r[0], r[1]) for r in con.execute(f"DESCRIBE SELECT * FROM {view}").fetchall()]
 
 
-def compute_column_stats(
-    con: duckdb.DuckDBPyConnection,
-    view: str,
-    seed: int = 0,
-    with_top: bool = True,
-    with_samples: bool | Literal["classify"] = True,
-    columns: list[str] | None = None,
-) -> tuple[int, list[ColumnStats]]:
-    """Compute statistics for every column of ``view`` in as few scans as possible.
+# Statistics of datasets and table artifacts, kept for the run that computed them: both
+# are immutable during a run and the profiler asks for the same ones from many tools.
+# Keys start with the run folder; the caches are emptied when they grow past their cap.
+_BASE_CACHE: dict[tuple[str, str], tuple[int, list[ColumnStats]]] = {}
+_EXTRA_CACHE: dict[tuple[str, str, str, str, int], list[Any]] = {}
+_MAX_CACHED_SOURCES = 64
+_MAX_CACHED_EXTRAS = 4096
+# Large tables: distinct counts up to this estimate are exact in one statement (small
+# hash sets); above it each column is counted by its own spillable GROUP BY.
+_SMALL_DISTINCT = 100_000
 
-    ``with_samples="classify"`` samples only the columns whose classification reads
-    sample values (strings and two-valued columns): one scan fewer per other column.
 
-    Returns:
-        The row count and one :class:`ColumnStats` per column.
-    """
-    schema = [(n, t) for n, t in describe(con, view) if columns is None or n in columns]
-    aggregates = ["count(*)"]
+def _cache_key(view: str) -> tuple[str, str] | None:
+    """Cache key of ``view`` in the active run; ``None`` for temporary tables and outside a run."""
+    from jellybean.runtime.context import maybe_current_run
+
+    ctx = maybe_current_run()
+    if ctx is None or not view.startswith('"'):
+        return None
+    return str(ctx.run_dir), view
+
+
+def clear_stats_cache() -> None:
+    """Forget cached statistics (tests, or a dataset rewritten during a run)."""
+    _BASE_CACHE.clear()
+    _EXTRA_CACHE.clear()
+
+
+def _exact_limit() -> int:
+    from jellybean.runtime.context import maybe_current_run
+    from jellybean.settings import get_settings
+
+    ctx = maybe_current_run()
+    return (ctx.settings if ctx else get_settings()).config.profiling.exact_stats_max_rows
+
+
+def _base_stats(con: duckdb.DuckDBPyConnection, view: str) -> tuple[int, list[ColumnStats]]:
+    """Row count and per-column statistics (no top values or samples) of every column."""
+    schema = describe(con, view)
+    rows = int(con.execute(f"SELECT count(*) FROM {view}").fetchall()[0][0])
+    # Exact distinct counts and quantiles keep every value in memory: fine for a few million
+    # rows, not for hundreds of millions. Large tables get sketches first.
+    large = rows > _exact_limit()
+    aggregates = []
     for name, dtype in schema:
         q = quote_ident(name)
         family = type_family(dtype)
-        aggregates += [f"count({q})", f"count(DISTINCT {q})"]
+        aggregates += [f"count({q})", f"approx_count_distinct({q})" if large else f"count(DISTINCT {q})"]
         if family in ("integer", "float", "temporal", "string"):
             aggregates += [f"min({q})", f"max({q})"]
         else:
             aggregates += ["NULL", "NULL"]
         if family in ("integer", "float"):
             qs = ", ".join(str(x) for x in QUANTILES)
-            aggregates += [f"quantile_cont({q}, [{qs}])", f"avg({q})", f"stddev_samp({q})"]
+            quantile = "approx_quantile" if large else "quantile_cont"
+            aggregates += [f"{quantile}({q}, [{qs}])", f"avg({q})", f"stddev_samp({q})"]
         else:
             aggregates += ["NULL", "NULL", "NULL"]
         aggregates.append(f"avg(length({q}))" if family == "string" else "NULL")
-    row = con.execute(f"SELECT {', '.join(aggregates)} FROM {view}").fetchall()[0]
-    rows = int(row[0])
+    row = con.execute(f"SELECT {', '.join(aggregates)} FROM {view}").fetchall()[0] if schema else []
 
     stats: list[ColumnStats] = []
     for i, (name, dtype) in enumerate(schema):
-        base = 1 + i * 8
+        base = i * 8
         non_null, distinct, mn, mx, qs, mean, std, avg_len = row[base : base + 8]
         stats.append(
             ColumnStats(
@@ -156,24 +183,134 @@ def compute_column_stats(
                 avg_length=None if avg_len is None else float(avg_len),
             )
         )
+    if large:
+        _exact_distinct(con, view, stats)
+    return rows, stats
+
+
+def _exact_distinct(con: duckdb.DuckDBPyConnection, view: str, stats: list[ColumnStats]) -> None:
+    """Replace the estimated distinct counts by exact ones without holding every value in memory.
+
+    Uniqueness decides keys, grain and join cardinality, so the counts must be
+    exact. Low-cardinality columns are counted together (their hash sets are
+    small); each high-cardinality column gets its own ``GROUP BY``, which reads
+    one column and spills to disk when it does not fit.
+    """
+    small = [c for c in stats if c.distinct <= _SMALL_DISTINCT]
+    for start in range(0, len(small), 50):
+        chunk = small[start : start + 50]
+        exprs = ", ".join(f"count(DISTINCT {quote_ident(c.name)})" for c in chunk)
+        for col, n in zip(chunk, con.execute(f"SELECT {exprs} FROM {view}").fetchall()[0], strict=True):
+            col.distinct = int(n)
+    for col in stats:
+        if col.distinct > _SMALL_DISTINCT:
+            q = quote_ident(col.name)
+            col.distinct = int(
+                con.execute(
+                    f"SELECT count(*) FROM (SELECT {q} FROM {view} WHERE {q} IS NOT NULL GROUP BY 1)"
+                ).fetchall()[0][0]
+            )
+
+
+def count_duplicate_rows(con: duckdb.DuckDBPyConnection, view: str) -> int:
+    """Exact duplicate rows of ``view`` (rows minus distinct rows), cached for the run.
+
+    A full-width ``SELECT DISTINCT *`` keeps every row in a hash table. Here the rows
+    are grouped by a 64-bit hash of the row first (8 bytes per group); only rows whose
+    hash repeats, usually none or few, are compared in full. The result is exact: equal
+    rows always share a hash, and rows that merely collide are told apart in the second step.
+    """
+    key = _cache_key(view)
+    extra_key = (*key, "", "duplicate_rows", 0) if key else None
+    if extra_key is not None and extra_key in _EXTRA_CACHE:
+        return int(_EXTRA_CACHE[extra_key][0])
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE _jb_dup_hashes AS SELECT hash(_t) AS h FROM {view} AS _t "
+        "GROUP BY 1 HAVING count(*) > 1"
+    )
+    try:
+        duplicates = 0
+        if con.execute("SELECT count(*) FROM _jb_dup_hashes").fetchall()[0][0]:
+            repeated = f"(SELECT * FROM {view} AS _t WHERE hash(_t) IN (SELECT h FROM _jb_dup_hashes))"
+            duplicates = con.execute(
+                f"SELECT (SELECT count(*) FROM {repeated}) - (SELECT count(*) FROM (SELECT DISTINCT * FROM {repeated}))"
+            ).fetchall()[0][0]
+    finally:
+        con.execute("DROP TABLE IF EXISTS _jb_dup_hashes")
+    if extra_key is not None:
+        _EXTRA_CACHE[extra_key] = [int(duplicates)]
+    return int(duplicates)
+
+
+def compute_column_stats(
+    con: duckdb.DuckDBPyConnection,
+    view: str,
+    seed: int = 0,
+    with_top: bool = True,
+    with_samples: bool | Literal["classify"] = True,
+    columns: list[str] | None = None,
+) -> tuple[int, list[ColumnStats]]:
+    """Compute statistics for every column of ``view`` in as few scans as possible.
+
+    ``with_samples="classify"`` samples only the columns whose classification reads
+    sample values (strings and two-valued columns): one scan fewer per other column.
+
+    Statistics of datasets and table artifacts are cached for the run (they do not
+    change), so the tools of one profiling session share them. Above
+    ``profiling.exact_stats_max_rows`` rows the quantiles are approximate
+    (``approx_quantile``) and the distinct counts, still exact, are computed
+    column by column so they can spill to disk.
+
+    Returns:
+        The row count and one :class:`ColumnStats` per column.
+    """
+    key = _cache_key(view)
+    cached = _BASE_CACHE.get(key) if key else None
+    if cached is None:
+        cached = _base_stats(con, view)
+        if key:
+            if len(_BASE_CACHE) >= _MAX_CACHED_SOURCES:
+                _BASE_CACHE.clear()
+            _BASE_CACHE[key] = cached
+    rows = cached[0]
+    # Callers may edit what they get: hand out copies, never the cached objects.
+    stats = [copy.copy(c) for c in cached[1] if columns is None or c.name in columns]
+    for col in stats:
+        col.top_values, col.sample_values = [], []
+
+    def extra(col: ColumnStats, kind: str, query: str) -> list[Any]:
+        extra_key = (*key, col.name, kind, int(seed)) if key else None
+        if extra_key is not None and extra_key in _EXTRA_CACHE:
+            return list(_EXTRA_CACHE[extra_key])
+        values = con.execute(query).fetchall()
+        if extra_key is not None:
+            if len(_EXTRA_CACHE) >= _MAX_CACHED_EXTRAS:
+                _EXTRA_CACHE.clear()
+            _EXTRA_CACHE[extra_key] = values
+        return list(values)
 
     for col in stats:
         q = quote_ident(col.name)
         if with_top and col.family in ("string", "integer", "boolean", "temporal") and col.non_null:
             col.top_values = [
                 (r[0], int(r[1]))
-                for r in con.execute(
-                    f"SELECT {q}, count(*) AS n FROM {view} WHERE {q} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5"
-                ).fetchall()
+                for r in extra(
+                    col,
+                    "top",
+                    f"SELECT {q}, count(*) AS n FROM {view} WHERE {q} IS NOT NULL "
+                    "GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 5",
+                )
             ]
         wanted = with_samples is True or (with_samples == "classify" and (col.family == "string" or col.distinct <= 2))
         if wanted and col.non_null:
             col.sample_values = [
                 r[0]
-                for r in con.execute(
+                for r in extra(
+                    col,
+                    "sample",
                     f"SELECT v FROM (SELECT DISTINCT {q} AS v FROM {view} WHERE {q} IS NOT NULL) "
-                    f"ORDER BY hash(v, {int(seed)}) LIMIT 5"
-                ).fetchall()
+                    f"ORDER BY hash(v, {int(seed)}) LIMIT 5",
+                )
             ]
     return rows, stats
 

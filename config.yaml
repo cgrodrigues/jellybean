@@ -19,6 +19,7 @@ tool_output:
 
 profiling:                         # keeps the profiler's checks cheap on large datasets
   distinct_max_rows: 5000000       # above this, integrity checks use the raw rows (exact duplicates not removed)
+  exact_stats_max_rows: 5000000    # above this, column quantiles are approximate (distinct counts stay exact)
   sample_rows: 200000              # candidate relations are screened on a sample of about this size first
   candidate_batch: 60              # candidate relations tested per SQL statement
 
@@ -52,6 +53,9 @@ detection:
   max_family_findings: 16          # ...with their own cap, on top of max_findings
   merge_overlap: 0.8               # merge findings when this share of the smaller one overlaps
   ts_threshold: 6.0                # robust z-score for time-series anomalies
+  cluster_max_rows: 200000         # HDBSCAN is fitted on a seeded sample above this many entities
+  group_max_pool: 10000            # most deviating pooled outliers grouped (pairwise distances: n^2 memory)
+  plot_max_points: 50000           # population points drawn in a scatter plot (members are always drawn)
 
 critic:
   min_stability: 0.6               # a finding below this stability cannot be "confirmed"

@@ -37,6 +37,7 @@ from jellybean.skills._shared.column_stats import (
     ColumnStats,
     classify_column,
     compute_column_stats,
+    count_duplicate_rows,
     describe,
     name_tokens,
     type_family,
@@ -72,6 +73,8 @@ _SCALE_SHIFT_FACTOR = 10.0
 _MIN_KEY_DISTINCT = 20
 # Number of values sampled to detect prefixes between key columns.
 _PREFIX_SAMPLE = 2000
+# discover_join_candidates: key-like columns compared per side (pairs grow with the product).
+_MAX_JOIN_KEY_COLUMNS = 12
 
 
 # --------------------------------------------------------------------------- #
@@ -118,12 +121,18 @@ def _category_variants(con, view: str, col: ColumnStats) -> tuple[int, list[list
     return len(groups), [g[1] for g in groups[:5]]
 
 
-def _scale_shift_by_file(con, source: Source, measures: list[str]) -> list[dict[str, Any]]:
-    """Per-file medians of measure columns; files deviating by >= 10x are flagged."""
+def _scale_shift_by_file(con, source: Source, measures: list[str], rows: int = 0) -> list[dict[str, Any]]:
+    """Per-file medians of measure columns; files deviating by >= 10x are flagged.
+
+    An exact median keeps every value in memory. Above ``profiling.exact_stats_max_rows``
+    rows the medians are approximate, which is ample to see a 10x shift.
+    """
     relation = _file_relation(source)
     if relation is None or not measures:
         return []
-    meds = ", ".join(f"median({quote_ident(m)})" for m in measures)
+    large = rows > _settings().config.profiling.exact_stats_max_rows
+    median = "approx_quantile({}, 0.5)" if large else "median({})"
+    meds = ", ".join(median.format(quote_ident(m)) for m in measures)
     rows = con.execute(f"SELECT __file, count(*), {meds} FROM {relation} GROUP BY 1 ORDER BY 1").fetchall()
     findings = []
     for j, measure in enumerate(measures):
@@ -204,7 +213,7 @@ def profile_table(dataset: str, seed: int | None = None) -> ToolResult:
         view = source.view
         rows, stats = compute_column_stats(con, view, seed=seed or 0)
         masker = _masker()
-        distinct_rows = con.execute(f"SELECT count(*) FROM (SELECT DISTINCT * FROM {view})").fetchall()[0][0]
+        distinct_rows = rows - count_duplicate_rows(con, view)
         issues: list[dict[str, Any]] = []
         if rows - distinct_rows > 0:
             dup = rows - distinct_rows
@@ -290,7 +299,7 @@ def profile_table(dataset: str, seed: int | None = None) -> ToolResult:
                 entry["masked"] = True
             columns_out.append(entry)
 
-        for shift in _scale_shift_by_file(con, source, measures):
+        for shift in _scale_shift_by_file(con, source, measures, rows):
             issues.append(_issue(source.name, shift.pop("column"), "scale_shift_by_file", "high", **shift))
 
         full = {
@@ -382,7 +391,7 @@ def infer_grain(dataset: str) -> ToolResult:
     try:
         with _open(dataset) as (con, source):
             rows, stats = compute_column_stats(con, source.view, with_top=False, with_samples=False)
-            distinct_rows = con.execute(f"SELECT count(*) FROM (SELECT DISTINCT * FROM {source.view})").fetchall()[0][0]
+            distinct_rows = rows - count_duplicate_rows(con, source.view)
             candidates: list[dict[str, Any]] = []
             for col in stats:
                 if col.non_null < rows:
@@ -403,23 +412,36 @@ def infer_grain(dataset: str) -> ToolResult:
                     )
             if not any(c["status"] != "near_unique" for c in candidates):
                 # Try pairs among the highest-cardinality complete columns.
-                top = [c.name for c in sorted(stats, key=lambda c: -c.distinct) if c.non_null == rows][:8]
-                for i, a in enumerate(top):
-                    for b in top[i + 1 :]:
-                        n = con.execute(
-                            f"SELECT count(*) FROM (SELECT DISTINCT {quote_ident(a)}, {quote_ident(b)} "
-                            f"FROM {source.view})"
-                        ).fetchall()[0][0]
-                        if n == rows:
-                            candidates.append({"columns": [a, b], "uniqueness": 1.0, "status": "unique"})
-                        elif n == distinct_rows:
-                            candidates.append(
-                                {
-                                    "columns": [a, b],
-                                    "uniqueness": round(n / rows, 5),
-                                    "status": "unique_after_removing_exact_duplicates",
-                                }
-                            )
+                top = [c for c in sorted(stats, key=lambda c: -c.distinct) if c.non_null == rows][:8]
+                # A pair can only be unique if its columns have enough values together. The
+                # survivors are screened in one scan with a sketch of the pair's distinct
+                # count; only the plausible ones are counted exactly (one scan each).
+                pairs = [
+                    (a.name, b.name)
+                    for i, a in enumerate(top)
+                    for b in top[i + 1 :]
+                    if a.distinct * b.distinct >= distinct_rows
+                ]
+                if pairs:
+                    sketches = ", ".join(
+                        f"approx_count_distinct(hash({quote_ident(a)}, {quote_ident(b)}))" for a, b in pairs
+                    )
+                    estimates = con.execute(f"SELECT {sketches} FROM {source.view}").fetchall()[0]
+                    pairs = [p for p, e in zip(pairs, estimates, strict=True) if e >= 0.9 * distinct_rows]
+                for a, b in pairs:
+                    n = con.execute(
+                        f"SELECT count(*) FROM (SELECT DISTINCT {quote_ident(a)}, {quote_ident(b)} FROM {source.view})"
+                    ).fetchall()[0][0]
+                    if n == rows:
+                        candidates.append({"columns": [a, b], "uniqueness": 1.0, "status": "unique"})
+                    elif n == distinct_rows:
+                        candidates.append(
+                            {
+                                "columns": [a, b],
+                                "uniqueness": round(n / rows, 5),
+                                "status": "unique_after_removing_exact_duplicates",
+                            }
+                        )
     except SourceNotFoundError as exc:
         return ToolResult.error(str(exc))
     order = {"unique": 0, "unique_after_removing_exact_duplicates": 1, "near_unique": 2}
@@ -774,15 +796,6 @@ def _key_columns(stats: list[ColumnStats]) -> list[ColumnStats]:
     ]
 
 
-def _overlap(con, left_table: str, right_table: str, strategy: str) -> tuple[int, int, int]:
-    """Distinct normalised values on each side and in common."""
-    nl = strategy_sql(strategy, "v")
-    return con.execute(
-        f"WITH a AS (SELECT DISTINCT {nl} AS n FROM {left_table}), b AS (SELECT DISTINCT {nl} AS n FROM {right_table}) "
-        f"SELECT (SELECT count(*) FROM a), (SELECT count(*) FROM b), (SELECT count(*) FROM a JOIN b USING (n))"
-    ).fetchall()[0]
-
-
 @tool
 def discover_join_candidates(left: str, right: str, seed: int | None = None) -> ToolResult:
     """Find and rank column pairs that could join two datasets.
@@ -806,6 +819,15 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
         _, lstats = compute_column_stats(con, lsrc.view, with_top=False, seed=seed or 0)
         _, rstats = compute_column_stats(con, rsrc.view, with_top=False, seed=seed or 0)
         lkeys, rkeys = _key_columns(lstats), _key_columns(rstats)
+        notes = []
+        for side, cols in (("left", lkeys), ("right", rkeys)):
+            if len(cols) > _MAX_JOIN_KEY_COLUMNS:
+                kept = {c.name for c in sorted(cols, key=lambda c: -c.distinct)[:_MAX_JOIN_KEY_COLUMNS]}
+                notes.append(
+                    f"{len(cols)} key-like columns on the {side} side: only the {_MAX_JOIN_KEY_COLUMNS} with "
+                    "most distinct values were compared."
+                )
+                cols[:] = [c for c in cols if c.name in kept]
         tables: dict[tuple[str, str], str] = {}
         for side, src, cols in (("l", lsrc, lkeys), ("r", rsrc, rkeys)):
             for i, col in enumerate(cols):
@@ -816,16 +838,42 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
                 )
                 tables[(side, col.name)] = name
 
+        # Samples, value sets and normalised value sets depend on one table only: each is
+        # computed once and reused for every pair it takes part in.
+        samples: dict[str, list[str]] = {}
+        value_sets: dict[str, set[str]] = {}
+        normalised: dict[tuple[str, str], tuple[str, int]] = {}
+
         def sample(table: str) -> list[str]:
-            return [
-                r[0]
-                for r in con.execute(
-                    f"SELECT v FROM {table} ORDER BY hash(v, {int(seed or 0)}) LIMIT {_PREFIX_SAMPLE}"
-                ).fetchall()
-            ]
+            if table not in samples:
+                samples[table] = [
+                    r[0]
+                    for r in con.execute(
+                        f"SELECT v FROM {table} ORDER BY hash(v, {int(seed or 0)}) LIMIT {_PREFIX_SAMPLE}"
+                    ).fetchall()
+                ]
+            return samples[table]
 
         def value_set(table: str) -> set[str]:
-            return {r[0] for r in con.execute(f"SELECT v FROM {table} LIMIT 300000").fetchall()}
+            if table not in value_sets:
+                value_sets[table] = {
+                    r[0] for r in con.execute(f"SELECT v FROM {table} ORDER BY v LIMIT 300000").fetchall()
+                }
+            return value_sets[table]
+
+        def normalised_values(table: str, strategy: str) -> tuple[str, int]:
+            """Temp table with the distinct normalised values of ``table``, and its size."""
+            if (table, strategy) not in normalised:
+                name = f"_n{len(normalised)}"
+                con.execute(
+                    f"CREATE TEMP TABLE {name} AS SELECT DISTINCT {strategy_sql(strategy, 'v')} AS n FROM {table}"
+                )
+                normalised[(table, strategy)] = (name, con.execute(f"SELECT count(*) FROM {name}").fetchall()[0][0])
+            return normalised[(table, strategy)]
+
+        def overlap(left_table: str, right_table: str, strategy: str) -> tuple[int, int, int]:
+            (a, n_a), (b, n_b) = normalised_values(left_table, strategy), normalised_values(right_table, strategy)
+            return n_a, n_b, con.execute(f"SELECT count(*) FROM {a} JOIN {b} USING (n)").fetchall()[0][0]
 
         candidates = []
         for lc in lkeys:
@@ -839,7 +887,7 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
                 strategies = ["none", "lower_trim", "strip_leading_zeros"] + [prefix_strategy(p) for p in prefixes]
                 best = None
                 for strategy in dict.fromkeys(strategies):
-                    n_left, n_right, common = _overlap(con, lt, rt, strategy)
+                    n_left, n_right, common = overlap(lt, rt, strategy)
                     left_cov = common / n_left if n_left else 0.0
                     right_cont = common / n_right if n_right else 0.0
                     # Prefer the simplest strategy unless another is clearly better.
@@ -890,14 +938,17 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
             "best": candidates[0] if candidates else None,
         },
         artifact_id=record.id,
-        warnings=[] if candidates else ["No column pair shares values; the datasets may not be joinable."],
+        warnings=[*notes, *([] if candidates else ["No column pair shares values; the datasets may not be joinable."])],
     )
 
 
-def _temporal_validity_columns(stats: list[ColumnStats]) -> str | None:
-    """Detect validity-interval columns (valid_from/valid_to, start/end...) on a dimension."""
+def _temporal_validity_columns(schema: list[tuple[str, str]]) -> str | None:
+    """Detect validity-interval columns (valid_from/valid_to, start/end...) on a dimension.
+
+    ``schema`` is ``[(column, duckdb_type), ...]``.
+    """
     markers = {"valid", "validity", "effective", "from", "to", "start", "end", "expiry", "expires"}
-    cols = [c.name for c in stats if c.family == "temporal" and name_tokens(c.name) & markers]
+    cols = [name for name, dtype in schema if type_family(dtype) == "temporal" and name_tokens(name) & markers]
     return "/".join(cols) if len(cols) >= 2 else None
 
 
@@ -956,29 +1007,47 @@ def test_join(
             return ToolResult.error(str(exc))
         names = [f"k{i}" for i in range(len(keys))]
         not_null = " AND ".join(f"{k} IS NOT NULL" for k in names)
-        key_tuple = "(" + ", ".join(names) + ")" if len(names) > 1 else names[0]
         on = " AND ".join(f"L.{k} = R.{k}" for k in names)
-        con.execute(f"CREATE TEMP TABLE L AS SELECT {', '.join(lk)} FROM {lsrc.view}")
-        con.execute(f"CREATE TEMP TABLE R AS SELECT {', '.join(rk)} FROM {rsrc.view}")
-        con.execute(f"CREATE TEMP TABLE RD AS SELECT DISTINCT {', '.join(names)} FROM R WHERE {not_null}")
+        # Each side is reduced once to its distinct keys with their row counts: every
+        # figure below comes from those two tables, so no row-level copy of the keys
+        # is kept and the row-level join is never executed.
+        cols = ", ".join(names)
+        con.execute(
+            f"CREATE TEMP TABLE L AS SELECT {cols}, count(*) AS n "
+            f"FROM (SELECT {', '.join(lk)} FROM {lsrc.view}) GROUP BY ALL"
+        )
+        con.execute(
+            f"CREATE TEMP TABLE R AS SELECT {cols}, count(*) AS n "
+            f"FROM (SELECT {', '.join(rk)} FROM {rsrc.view}) GROUP BY ALL"
+        )
+        con.execute(f"CREATE TEMP TABLE RD AS SELECT {cols}, n FROM R WHERE {not_null}")
         left_rows, left_null, left_distinct = con.execute(
-            f"SELECT count(*), count(*) FILTER (WHERE NOT ({not_null})), count(DISTINCT {key_tuple}) "
-            f"FILTER (WHERE {not_null}) FROM L"
+            f"SELECT coalesce(sum(n), 0), coalesce(sum(n) FILTER (WHERE NOT ({not_null})), 0), "
+            f"count(*) FILTER (WHERE {not_null}) FROM L"
         ).fetchall()[0]
         right_rows, right_keyed, right_distinct = con.execute(
-            f"SELECT count(*), count(*) FILTER (WHERE {not_null}), (SELECT count(*) FROM RD) FROM R"
+            f"SELECT coalesce(sum(n), 0), coalesce(sum(n) FILTER (WHERE {not_null}), 0), "
+            f"count(*) FILTER (WHERE {not_null}) FROM R"
         ).fetchall()[0]
-        matched_rows = con.execute(f"SELECT count(*) FROM L SEMI JOIN RD ON {on.replace('R.', 'RD.')}").fetchall()[0][0]
-        joined_rows = con.execute(f"SELECT count(*) FROM L LEFT JOIN R ON {on}").fetchall()[0][0]
-        unmatched_distinct = con.execute(
-            f"SELECT count(*) FROM (SELECT DISTINCT {', '.join(names)} FROM L WHERE {not_null}) L "
-            f"ANTI JOIN RD ON {on.replace('R.', 'RD.')}"
-        ).fetchall()[0][0]
-        dups = con.execute(
-            f"SELECT {', '.join(names)}, count(*) AS n FROM R WHERE {not_null} GROUP BY ALL HAVING count(*) > 1 "
-            f"ORDER BY n DESC, {', '.join(names)} LIMIT 1000"
-        ).fetchall()
-        _, rstats = compute_column_stats(con, rsrc.view, with_top=False, with_samples=False)
+        on_rd = on.replace("R.", "RD.")
+        # Rows with a match, rows after the join (a left row with m matches counts m times,
+        # one without a match once) and distinct left keys without a match.
+        matched_rows, joined_rows, unmatched_distinct = con.execute(
+            f"SELECT coalesce(sum(L.n) FILTER (WHERE RD.n IS NOT NULL), 0), "
+            f"coalesce(sum(L.n * coalesce(RD.n, 1)), 0), "
+            f"count(*) FILTER (WHERE RD.n IS NULL AND {' AND '.join(f'L.{k} IS NOT NULL' for k in names)}) "
+            f"FROM L LEFT JOIN RD ON {on_rd}"
+        ).fetchall()[0]
+        left_rows, left_null, right_rows, right_keyed = (
+            int(left_rows),
+            int(left_null),
+            int(right_rows),
+            int(right_keyed),
+        )
+        matched_rows, joined_rows = int(matched_rows), int(joined_rows)
+        dups = con.execute(f"SELECT {cols}, n FROM RD WHERE n > 1 ORDER BY n DESC, {cols} LIMIT 1000").fetchall()
+        # Validity columns are found from names and types: no statistics needed.
+        validity_columns = _temporal_validity_columns(list(rcols.items()))
         # Sparse keys: are the null keys decided by another column (structural)?
         nulls = None
         if left_null and len(keys) == 1:
@@ -1000,7 +1069,6 @@ def test_join(
     cardinality = {("1", "1"): "1:1", ("N", "1"): "N:1", ("1", "N"): "1:N", ("N", "N"): "N:M"}[(left_side, right_side)]
     # Validity intervals version a dimension only when a key has several rows;
     # with unique keys the dates are plain attributes (e.g. a promotion's period).
-    validity_columns = _temporal_validity_columns(rstats)
     temporal_validity = validity_columns if right_distinct < right_keyed else None
 
     margin, warnings = None, []

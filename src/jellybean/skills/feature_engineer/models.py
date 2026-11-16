@@ -114,12 +114,15 @@ def _open_events(input: str, entity: str, needed: list[str | None]) -> tuple[duc
     """Connection with a temp table ``ev`` (rows with an entity); checks the columns exist."""
     source = resolve_source(input)
     con = connect()
-    schema = dict(describe(con, source.view))
-    missing = [c for c in [entity, *needed] if c and c not in schema]
-    if missing:
-        con.close()
-        raise ValueError(f"Unknown columns: {missing}. Columns: {list(schema)}")
-    con.execute(f"CREATE TEMP TABLE ev AS SELECT * FROM {source.view} WHERE {quote_ident(entity)} IS NOT NULL")
+    try:
+        schema = dict(describe(con, source.view))
+        missing = [c for c in [entity, *needed] if c and c not in schema]
+        if missing:
+            raise ValueError(f"Unknown columns: {missing}. Columns: {list(schema)}")
+        con.execute(f"CREATE TEMP TABLE ev AS SELECT * FROM {source.view} WHERE {quote_ident(entity)} IS NOT NULL")
+    except BaseException:
+        con.close()  # never leave the connection open when the copy fails (e.g. out of memory)
+        raise
     return con, schema
 
 
