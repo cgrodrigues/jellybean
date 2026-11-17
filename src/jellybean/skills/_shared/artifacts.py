@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from jellybean.runtime.cancellation import check_cancelled
 from jellybean.runtime.context import RunContext, current_run
 from jellybean.runtime.tool_registry import current_tool, to_jsonable
 
@@ -178,12 +179,20 @@ class ArtifactStore:
             parents: Ids of artifacts or dataset names this one derives from.
             params: Parameters that produced it (kept for reproducibility).
         """
+        # A call that timed out leaves nothing behind: work that could not be interrupted
+        # may still reach this point after the caller was told about the timeout.
+        check_cancelled()
         artifact_id = self._reserve_id(prefix)
         rel_path = Path("artifacts") / f"{artifact_id}.{_EXTENSIONS[type_]}"
         abs_path = self.ctx.run_dir / rel_path
         try:
             abs_path.parent.mkdir(parents=True, exist_ok=True)
             row_count = writer(abs_path)
+            try:
+                check_cancelled()
+            except BaseException:
+                abs_path.unlink(missing_ok=True)
+                raise
             # Make the file read-only: artifacts are immutable.
             abs_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
             record = ArtifactRecord(

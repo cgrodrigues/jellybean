@@ -114,6 +114,7 @@ def load_finding(finding_id: str, ctx: RunContext | None = None) -> Finding:
 def save_finding(finding: Finding, ctx: RunContext | None = None) -> None:
     """Write a finding atomically (findings are mutable records, unlike artifacts)."""
     ctx = ctx or current_run()
+    check_cancelled()  # a call that timed out changes nothing
     ctx.findings_dir.mkdir(parents=True, exist_ok=True)
     path = _path(ctx, finding.id)
     with _LOCK:

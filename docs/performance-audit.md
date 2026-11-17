@@ -112,7 +112,7 @@ reading a group costs about one row group whatever the size of the table.
 | `skills/_shared/findings.py` | `signature` | Both tables loaded for one centroid. | `group_signature` reads the members only. |
 | `skills/_shared/artifacts.py` | `save_dataframe` | Tables written as one row group, so a filtered read decoded the whole table. | Row groups of 100,000 rows. |
 | `skills/_shared/detection.py` | `outlier_scores` (ecod, hbos) | Several full-size matrices inside the libraries. | Run a few columns at a time above 20M cells (both add per-column scores; same result). |
-| `skills/_shared/detection.py` | `outlier_scores` (lof) | Every row compared with a 50,000-row sample. | The sample shrinks so that rows x sample stays under 25 billion pairs. |
+| `skills/_shared/detection.py` | `outlier_scores` (lof) | Every row compared with a 50,000-row sample. | The sample shrinks so that rows x sample stays under a fixed number of pairs (6 billion since the third pass). |
 | `skills/_shared/detection.py` | `outlier_scores` (autoencoder) | Trained on every row. | Above `detection.fit_max_rows`: trained on a seeded sample, scored in batches. |
 | `skills/_shared/detection.py` | `context_defining_features`, `contextual_scores` | Six to seven full-size temporary matrices. | Computed one column at a time; only the chosen features are transformed. |
 | `skills/_shared/detection.py` | `grouped_series_anomalies` | One frame per group built in a Python loop. | The grid is built in one vectorised step (`_life_grid`). The number of series points was already capped at 3M. |
@@ -159,6 +159,44 @@ reading a group costs about one row group whatever the size of the table.
 What bounds none of the above: memory outside DuckDB has no cap. The fixes keep the peak
 near one to three copies of the feature matrix, but a population that does not fit in RAM
 as one matrix still needs a larger machine or a filter (`run`'s `--filter`).
+
+## Third pass: timeouts for work that is not a query
+
+Run `2026-11-17_003` (592,282 entities) showed that the timeout of the first pass only
+covered DuckDB. `run_clustering(hdbscan)` was reported as timed out after 300 s, but the
+call lasted 697 s and still wrote its artifacts; the agent repeated it and lost another
+704 s.
+
+**Cause, verified.** A model fit is one long call into compiled code. While it holds the
+interpreter lock the thread that enforces the timeout cannot run: in a test,
+`thread.join(1.0)` on a worker executing one C call returned after 4.0 s (when the work
+ended), and after 1.0 s when the worker ran a Python loop.
+
+| Change | Where | Effect |
+| --- | --- | --- |
+| Model fits in a worker process | `runtime/isolated.py`; `outlier_scores`, `cluster_labels`, `reduce_matrix` in `skills/_shared/detection.py` | Above `limits.isolate_above_rows` (20,000) rows the fit runs in a child process, with the same function, arguments and seed (tests check the results are identical). The caller only waits, so the timeout fires on time and kills the process. Data goes through `.npy` files mapped by the child, not through a pipe. |
+| A timed-out call leaves nothing | `ArtifactStore.create`, `patch_spec`, `save_finding` | They check for cancellation before writing (and `create` removes the file if the call was cancelled while writing). Work that could not be interrupted and finishes later is discarded. |
+| Per-tool timeouts | `limits.tool_timeouts` | For example `{run_clustering: 900}`. |
+| HDBSCAN sample | `detection.cluster_max_rows` 200,000 -> 75,000; `params={"max_rows": n}` | See the measurements. |
+| LOF reference sample | `_LOF_MAX_PAIRS` 25 -> 6 billion pairs | At 592k entities the sample goes from 42k to 10k rows: about a quarter of the 237 s measured in that run. |
+
+**HDBSCAN fit time** (10 PCA components, `min_cluster_size=10`, development machine):
+
+| Rows | Time |
+| --- | --- |
+| 25,000 | 3.8 s |
+| 50,000 | 16.3 s |
+| 100,000 | 72.9 s |
+| 200,000 | 321.7 s |
+
+Time grows with the square of the rows. The run above took about 700 s for 200,000 rows,
+a little over twice these figures, so 75,000 rows should take about 90 s there and
+100,000 about 160 s. 75,000 is the default: it stays inside a 300 s limit with room for
+loading and plotting. A smaller sample finds fewer small clusters (a group needs
+`min_cluster_size` members inside the sample); raise `cluster_max_rows` together with
+`limits.tool_timeouts.run_clustering` when that matters.
+
+**Not verified here:** the 592,282-entity table is not on the development machine.
 
 ## Medium and low findings (follow-ups)
 

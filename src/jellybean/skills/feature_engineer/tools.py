@@ -40,7 +40,7 @@ from jellybean.skills._shared.catalog import (
     sql_escape,
 )
 from jellybean.skills._shared.column_stats import compute_column_stats, describe
-from jellybean.skills._shared.detection import component_table
+from jellybean.skills._shared.detection import DetectionError, component_table, reduce_matrix
 from jellybean.skills._shared.spec_tools import SpecMissingError, patch_spec, read_spec
 from jellybean.skills.feature_engineer._common import (
     _entity_of,
@@ -854,35 +854,22 @@ def reduce_dimensions(
     k = min(n_components, X.shape[1], X.shape[0])
     summary: dict[str, Any] = {"method": method, "n_components": k, "entities": len(df)}
     names = list(df.columns.drop(entity))
+    cap = current_run().settings.config.detection.fit_max_rows
+    try:
+        reduced = reduce_matrix(X, method, k, int(seed), fit_max_rows=cap)
+    except DetectionError as exc:
+        return ToolResult.error(str(exc))
+    Z = reduced["Z"]
     if method == "pca":
-        from sklearn.decomposition import PCA
-
-        model = PCA(n_components=k, random_state=seed)
-        Z = model.fit_transform(X)
-        ratios = model.explained_variance_ratio_
+        ratios, components = reduced["ratios"], reduced["components"]
         summary["explained_variance"] = [round(float(r), 4) for r in ratios]
         summary["cumulative_explained"] = round(float(ratios.sum()), 4)
         summary["top_loadings"] = {
-            f"c{i + 1}": [
-                [names[j], round(float(model.components_[i][j]), 3)]
-                for j in np.argsort(-np.abs(model.components_[i]))[:5]
-            ]
+            f"c{i + 1}": [[names[j], round(float(components[i][j]), 3)] for j in np.argsort(-np.abs(components[i]))[:5]]
             for i in range(min(3, k))
         }
-    else:
-        try:
-            import umap
-        except ImportError:
-            return ToolResult.error("UMAP is not installed: run `uv sync --extra explain` or use method 'pca'.")
-        cap = current_run().settings.config.detection.fit_max_rows
-        if len(X) <= cap:
-            Z = umap.UMAP(n_components=k, random_state=seed).fit_transform(X)
-        else:
-            # UMAP on millions of rows does not finish: fit on a seeded sample, project the rest.
-            chosen = np.sort(np.random.default_rng(seed).choice(len(X), cap, replace=False))
-            model = umap.UMAP(n_components=k, random_state=seed).fit(X[chosen])
-            Z = np.vstack([model.transform(X[start : start + 100_000]) for start in range(0, len(X), 100_000)])
-            summary["fitted_on_sample"] = cap
+    elif "fitted_on" in reduced:
+        summary["fitted_on_sample"] = int(reduced["fitted_on"])
     out = pd.DataFrame(Z, columns=[f"c{i + 1}" for i in range(k)])
     out.insert(0, entity, df[entity].to_numpy())
     store = _store()

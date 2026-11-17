@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from jellybean.runtime.cancellation import check_cancelled
+from jellybean.runtime.isolated import IsolatedWorkError, run_isolated, should_isolate
 
 OUTLIER_METHODS = ("isolation_forest", "lof", "ecod", "hbos", "autoencoder")
 CLUSTER_METHODS = ("hdbscan", "gmm", "kmeans")
@@ -30,7 +31,7 @@ class DetectionError(ValueError):
 _COLUMNWISE_CELLS = 20_000_000
 # LOF compares every row with the fitted sample: the sample shrinks so that
 # rows x sample stays below this many pairs (never below _LOF_MIN_SAMPLE rows).
-_LOF_MAX_PAIRS = 25_000_000_000
+_LOF_MAX_PAIRS = 6_000_000_000
 _LOF_MIN_SAMPLE = 5_000
 _SCORE_BATCH = 100_000
 
@@ -47,6 +48,19 @@ def _by_columns(fit_scores: Any, X: np.ndarray) -> np.ndarray:
     return total
 
 
+_THIS = "jellybean.skills._shared.detection"
+
+
+def _in_worker(function: str, X: np.ndarray, kwargs: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Run one of this module's ``*_local`` functions in a worker process that the timeout can kill."""
+    try:
+        return run_isolated(f"{_THIS}:{function}", {"X": X}, kwargs)
+    except IsolatedWorkError as exc:
+        if exc.kind == "DetectionError":
+            raise DetectionError(str(exc)) from exc
+        raise RuntimeError(f"{exc.kind}: {exc}") from exc
+
+
 def outlier_scores(
     X: np.ndarray,
     method: str,
@@ -56,6 +70,31 @@ def outlier_scores(
     fit_max_rows: int | None = None,
 ) -> np.ndarray:
     """Outlier score per row (higher = more anomalous).
+
+    Above ``limits.isolate_above_rows`` rows the fit runs in a worker process
+    (same function, same seed, same scores), so that the tool timeout can stop it.
+    """
+    kwargs = {
+        "method": method,
+        "params": dict(params),
+        "seed": seed,
+        "lof_max_rows": lof_max_rows,
+        "fit_max_rows": fit_max_rows,
+    }
+    if should_isolate(len(X)):
+        return _in_worker("outlier_scores_local", X, kwargs)["result"]
+    return outlier_scores_local(X, **kwargs)
+
+
+def outlier_scores_local(
+    X: np.ndarray,
+    method: str,
+    params: dict[str, Any],
+    seed: int,
+    lof_max_rows: int,
+    fit_max_rows: int | None = None,
+) -> np.ndarray:
+    """:func:`outlier_scores` computed in this process.
 
     Memory stays bounded on large populations: ECOD and HBOS run a few columns
     at a time (same scores), LOF fits on a sample, and above ``fit_max_rows``
@@ -151,6 +190,52 @@ def low_support(n_events: pd.Series, quantile: float = 0.10) -> pd.Series:
 def cluster_labels(
     X: np.ndarray, method: str, params: dict[str, Any], seed: int, max_rows: int | None = None
 ) -> np.ndarray:
+    """Cluster label per row (-1 = noise, for HDBSCAN); in a worker process above ``limits.isolate_above_rows``."""
+    kwargs = {"method": method, "params": dict(params), "seed": seed, "max_rows": max_rows}
+    if should_isolate(len(X)):
+        return _in_worker("cluster_labels_local", X, kwargs)["result"]
+    return cluster_labels_local(X, **kwargs)
+
+
+def reduce_matrix(X: np.ndarray, method: str, k: int, seed: int, fit_max_rows: int | None = None) -> dict[str, Any]:
+    """Project ``X`` onto ``k`` dimensions; in a worker process above ``limits.isolate_above_rows``.
+
+    Returns ``Z`` (the projection) and, for PCA, ``ratios`` (explained variance
+    ratios) and ``components``; for UMAP on a sample, ``fitted_on`` (rows).
+    """
+    kwargs = {"method": method, "k": k, "seed": seed, "fit_max_rows": fit_max_rows}
+    if should_isolate(len(X)):
+        return _in_worker("reduce_matrix_local", X, kwargs)
+    return reduce_matrix_local(X, **kwargs)
+
+
+def reduce_matrix_local(
+    X: np.ndarray, method: str, k: int, seed: int, fit_max_rows: int | None = None
+) -> dict[str, Any]:
+    """:func:`reduce_matrix` computed in this process."""
+    if method == "pca":
+        from sklearn.decomposition import PCA
+
+        model = PCA(n_components=k, random_state=seed)
+        return {"Z": model.fit_transform(X), "ratios": model.explained_variance_ratio_, "components": model.components_}
+    if method != "umap":
+        raise DetectionError(f"Unknown reduction method '{method}'. Use pca or umap.")
+    try:
+        import umap
+    except ImportError as exc:
+        raise DetectionError("UMAP is not installed: run `uv sync --extra explain` or use method 'pca'.") from exc
+    if fit_max_rows is None or len(X) <= fit_max_rows:
+        return {"Z": umap.UMAP(n_components=k, random_state=seed).fit_transform(X)}
+    # UMAP on millions of rows does not finish: fit on a seeded sample, project the rest.
+    chosen = np.sort(np.random.default_rng(seed).choice(len(X), fit_max_rows, replace=False))
+    model = umap.UMAP(n_components=k, random_state=seed).fit(X[chosen])
+    Z = np.vstack([model.transform(X[start : start + _SCORE_BATCH]) for start in range(0, len(X), _SCORE_BATCH)])
+    return {"Z": Z, "fitted_on": np.array(fit_max_rows)}
+
+
+def cluster_labels_local(
+    X: np.ndarray, method: str, params: dict[str, Any], seed: int, max_rows: int | None = None
+) -> np.ndarray:
     """Cluster label per row (-1 = noise, for HDBSCAN).
 
     HDBSCAN compares entities pairwise, so above ``max_rows`` it is fitted on a
@@ -162,6 +247,8 @@ def cluster_labels(
         model = HDBSCAN(
             min_cluster_size=int(params.get("min_cluster_size", 10)), min_samples=params.get("min_samples"), copy=True
         )
+        if params.get("max_rows"):  # a smaller sample asked for by the caller (e.g. after a timeout)
+            max_rows = min(int(params["max_rows"]), max_rows or int(params["max_rows"]))
         if max_rows is not None and len(X) > max_rows:
             chosen = np.sort(np.random.default_rng(seed).choice(len(X), size=max_rows, replace=False))
             labels = np.full(len(X), -1, dtype=int)

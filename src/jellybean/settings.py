@@ -75,6 +75,11 @@ class LimitsConfig(_Section):
     duckdb_memory_limit: str | None = "4GB"  # null = DuckDB default (80% of RAM)
     duckdb_threads: int | None = Field(4, ge=1)  # null = DuckDB default (all cores)
     duckdb_max_temp_size: str | None = "50GB"  # cap on spilled data; null = DuckDB default
+    # Timeout of single tools, in seconds, overriding tool_timeout_s: {"run_clustering": 900}.
+    tool_timeouts: dict[str, float] = Field(default_factory=dict)
+    # Model fits (outlier methods, clustering, dimensionality reduction) on more rows than
+    # this run in a worker process that is killed at the timeout; null = always in-process.
+    isolate_above_rows: int | None = Field(20_000, ge=0)
 
 
 class ProfilingConfig(_Section):
@@ -150,7 +155,10 @@ class DetectionConfig(_Section):
     merge_overlap: float = Field(0.8, gt=0, le=1)  # merge when this share of the smaller group is shared
     ts_threshold: float = Field(6.0, gt=0)  # robust z for time-series anomalies
     # Size caps of the steps whose cost grows faster than the number of entities.
-    cluster_max_rows: int = Field(200_000, ge=1000)  # HDBSCAN is fitted on a seeded sample above this
+    # HDBSCAN is fitted on a seeded sample above this. Its time grows with the square of the
+    # rows (16 s at 50k, 73 s at 100k, 322 s at 200k on 10 dimensions): 75k keeps it well
+    # inside the default tool timeout.
+    cluster_max_rows: int = Field(75_000, ge=1000)
     group_max_pool: int = Field(10_000, ge=100)  # pooled outliers grouped by pairwise distance (n^2 memory)
     plot_max_points: int = Field(50_000, ge=1000)  # population points drawn in a scatter plot
     # Above this many entities: outlier models are fitted on a seeded sample and score

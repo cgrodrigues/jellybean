@@ -15,6 +15,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from jellybean.runtime.cancellation import check_cancelled
 from jellybean.runtime.context import RunContext, current_run
 from jellybean.runtime.tool_registry import ToolResult, _format_validation_error, tool
 from jellybean.runtime.tracing import trace_event
@@ -46,6 +47,7 @@ def read_spec(ctx: RunContext | None = None) -> AnalysisSpec:
 def patch_spec(patch: dict[str, Any], ctx: RunContext | None = None, allow_protected: bool = False) -> AnalysisSpec:
     """Apply a patch atomically and return the new spec."""
     ctx = ctx or current_run()
+    check_cancelled()  # a call that timed out changes nothing
     with _SPEC_LOCK:
         spec = apply_patch(read_spec(ctx), patch, allow_protected=allow_protected)
         save_spec(ctx.spec_path, spec)
