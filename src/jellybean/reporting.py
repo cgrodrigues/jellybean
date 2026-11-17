@@ -263,7 +263,7 @@ def build_report(ctx: RunContext, run_result: dict[str, Any] | None = None) -> s
                 f"{j.cardinality} | {_fmt(j.coverage)} | {_fmt(j.fanout)} | {_fmt(j.confidence)} | {j.status} |"
             )
     if spec.grain:
-        add(f"\n**{t['grain']}:** `{spec.grain.dataset}` → {', '.join(spec.grain.columns)}")
+        add(f"\n**{t['grain']}:** `{spec.grain.dataset}` → {spec.grain.label()}")
     if spec.entity:
         alts = ", ".join(spec.entity.alternatives) or "-"
         add(f"\n**{t['entity']}:** `{spec.entity.column}` ({t['alternatives']}: {alts})")

@@ -387,6 +387,8 @@ def infer_grain(dataset: str) -> ToolResult:
 
     Reports single columns that are unique, unique once exact duplicate rows are
     removed, or nearly unique; tries column pairs only when no single column works.
+    `unique_key: false` means the table has no key (an event-level table): that
+    is a valid result, recorded by propose_spec as "no unique key".
 
     Args:
         dataset: Dataset name or table artifact id.
@@ -456,13 +458,23 @@ def infer_grain(dataset: str) -> ToolResult:
                 source.name, None, "duplicate_rows", _severity((rows - distinct_rows) / rows), rows=rows - distinct_rows
             )
         )
-    warnings = [] if candidates else ["No unique column or pair found; the grain may need more columns."]
+    unique_key = bool(candidates)
+    warnings = (
+        []
+        if unique_key
+        else [
+            "No unique key: no column or pair of columns identifies a row. This is a valid result for an "
+            "event-level table (several rows per entity and timestamp can be legitimate). Pass this artifact to "
+            "propose_spec as it is; do not look for a key by adding columns."
+        ]
+    )
     record = _store().save_json(
         f"grain_{source.name}",
         {
             "dataset": source.name,
             "rows": rows,
             "distinct_rows": distinct_rows,
+            "unique_key": unique_key,
             "candidates": candidates,
             "issues": issues,
         },
@@ -473,6 +485,7 @@ def infer_grain(dataset: str) -> ToolResult:
             "dataset": source.name,
             "rows": rows,
             "exact_duplicate_rows": rows - distinct_rows,
+            "unique_key": unique_key,
             "candidates": candidates[:8],
             "recommended": candidates[0]["columns"] if candidates else None,
         },
@@ -1535,9 +1548,18 @@ def propose_spec(
                     "evidence_artifact": artifact_id,
                 }
             )
-        grain_doc = _load_kind(store, grain, "candidates")
-        if not grain_doc["candidates"]:
-            return ToolResult.error(f"Grain artifact '{grain}' has no candidates.")
+        grain_doc = store.load_json(grain)
+        if not isinstance(grain_doc, dict) or not {"candidates", "distinct_rows"} <= set(grain_doc):
+            return ToolResult.error(
+                f"'{grain}' is not a grain artifact: pass the artifact id returned by infer_grain on the primary "
+                "dataset (also when it found no unique key)."
+            )
+        # No candidate: the table has no key. That is recorded, not refused.
+        grain_patch = (
+            {"dataset": grain_doc["dataset"], "columns": grain_doc["candidates"][0]["columns"], "unique": True}
+            if grain_doc["candidates"]
+            else {"dataset": grain_doc["dataset"], "columns": [], "unique": False}
+        )
         ent_doc = _load_kind(store, entities, "candidates")
         if not ent_doc["candidates"]:
             return ToolResult.error(f"Entities artifact '{entities}' has no candidates.")
@@ -1551,7 +1573,7 @@ def propose_spec(
         evidence = {"grain": grain, "entity": entities, **{f"semantic_types:{doc['dataset']}": a for doc, a in typed}}
         patch: dict[str, Any] = {
             "joins": joins,
-            "grain": {"dataset": grain_doc["dataset"], "columns": grain_doc["candidates"][0]["columns"]},
+            "grain": grain_patch,
             "entity": {
                 "column": ent_doc["candidates"][0]["column"],
                 "alternatives": [c["column"] for c in ent_doc["candidates"][1:4]],

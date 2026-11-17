@@ -291,16 +291,26 @@ def _spec_checks(spec: AnalysisSpec, store: ArtifactStore) -> tuple[list[dict[st
     if spec.grain is None:
         problems.append("No grain in the spec.")
     else:
-        item = {"item": "grain", "value": spec.grain.columns, "auto": False}
+        unique = spec.grain.unique
+        item = {"item": "grain", "value": spec.grain.columns if unique else spec.grain.label(), "auto": False}
         grain_id = spec.evidence_artifacts.get("grain")
         if grain_id:
-            cands = store.load_json(grain_id)["candidates"]
+            doc = store.load_json(grain_id)
+            cands = doc["candidates"]
             top = cands[0] if cands else None
             item["evidence"] = {
-                "status": top["status"] if top else None,
-                "exact_duplicate_rows": store.load_json(grain_id)["rows"] - store.load_json(grain_id)["distinct_rows"],
+                "status": (top["status"] if top else None) if unique else "no unique key",
+                "exact_duplicate_rows": doc["rows"] - doc["distinct_rows"],
             }
-            item["auto"] = bool(top) and top["columns"] == spec.grain.columns and top["status"] != "near_unique"
+            item["auto"] = (
+                unique and bool(top) and top["columns"] == spec.grain.columns and top["status"] != "near_unique"
+            )
+        if not unique:
+            # A table without a key is a valid grain, but a person must agree with it.
+            item["evidence"] = item.get("evidence", {}) | {
+                "meaning": "event-level rows: several rows per entity and timestamp are kept as they are"
+            }
+            item["auto"] = False
         items.append(item)
     return items, problems
 

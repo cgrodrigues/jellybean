@@ -207,6 +207,19 @@ def _key_columns(columns: list[str]) -> list[str]:
     return keys
 
 
+def _non_unique_grain(dataset: str) -> set[str] | None:
+    """Grain columns of ``dataset`` (or of the dataset it was prepared from) when the grain is not unique."""
+    try:
+        spec = read_spec()
+    except SpecMissingError:
+        return None
+    grain = spec.grain
+    if grain is None or grain.unique or not grain.columns:
+        return None
+    names = {grain.dataset, spec.prepared.get(grain.dataset), spec.enriched_artifact}
+    return set(grain.columns) if dataset in names else None
+
+
 def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tuple[str, list[dict[str, Any]], bool]:
     """Apply ``ops`` as a chain of temp tables. Returns (final table, per-op log, has_key_log)."""
     needs_file = any(isinstance(o, FixUnitsOp) and o.file for o in ops)
@@ -222,6 +235,7 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         log_cols = ", ".join(f"{quote_ident(k)}" for k in keys)
         con.execute(f"CREATE OR REPLACE TEMP TABLE __log AS SELECT ''::VARCHAR AS op_id, {log_cols} FROM s0 LIMIT 0")
     log: list[dict[str, Any]] = []
+    non_unique_grain = _non_unique_grain(source.name)
 
     def need(col: str) -> str:
         if col not in schema:
@@ -235,6 +249,12 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         removed = False
         if isinstance(op, DedupeOp):
             removed = True
+            if op.keys and set(op.keys) == non_unique_grain:
+                raise ValueError(
+                    f"dedupe on {sorted(op.keys)} refused: these columns are the grain of the dataset and it is "
+                    "not unique (several rows per combination are legitimate events). Only exact duplicate rows "
+                    'may be removed: {"op": "dedupe"} without keys.'
+                )
             if op.keys:
                 part = ", ".join(need(k) for k in op.keys)
                 order_col = need(op.order_by) if op.order_by else None
@@ -527,8 +547,26 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
             )
             continue
         semantic = _semantic_type(spec, dataset, column) if column else None
-        if kind == "duplicate_rows":
+        no_key = spec.grain is not None and not spec.grain.unique and spec.grain.dataset == dataset
+        if kind == "duplicate_rows" and no_key:
+            # Without a key, identical rows can be distinct events: removing them is a person's decision.
+            add(
+                dataset,
+                {"op": "dedupe"},
+                issue,
+                f"{detail.get('rows')} exact duplicate rows. The table has no unique key, so identical rows may be "
+                "distinct events: remove them only if they are known to be repeated records.",
+                explicit=True,
+            )
+        elif kind == "duplicate_rows":
             add(dataset, {"op": "dedupe"}, issue, f"{detail.get('rows')} exact duplicate rows inflate counts.")
+        elif kind == "duplicate_keys" and no_key and set(column.split(",")) == set(spec.grain.columns):
+            not_addressed.append(
+                {
+                    "issue_id": issue["id"],
+                    "reason": "these columns are the non-unique grain: repeated combinations are legitimate events",
+                }
+            )
         elif kind == "duplicate_keys":
             order_by = _temporal_column(spec, dataset)
             keys = column.split(",")
