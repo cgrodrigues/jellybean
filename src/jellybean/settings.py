@@ -92,6 +92,16 @@ class ProfilingConfig(_Section):
     candidate_batch: int = Field(60, ge=1, le=500)
 
 
+class FeaturesConfig(_Section):
+    """Size caps of the feature engineer."""
+
+    # Rows of the intermediate (entity, hour) or (entity, day) table of the per-level
+    # window features; above it the window is skipped with a warning.
+    window_max_rows: int = Field(200_000_000, ge=1000)
+    # Category levels expanded into window features, over all columns.
+    window_max_levels: int = Field(60, ge=1)
+
+
 class ToolOutputConfig(_Section):
     max_output_chars: int = Field(4000, ge=500)
     max_raw_rows: int = Field(20, ge=1)
@@ -200,6 +210,7 @@ class AppConfig(_Section):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
     profiling: ProfilingConfig = Field(default_factory=ProfilingConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     join_confidence: JoinConfidenceConfig = Field(default_factory=JoinConfidenceConfig)
     pattern_registry: PatternRegistryConfig = Field(default_factory=PatternRegistryConfig)

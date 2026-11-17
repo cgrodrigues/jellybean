@@ -59,7 +59,7 @@ from jellybean.skills.feature_engineer.models import (  # noqa: F401  (re-export
 )
 
 Template = Literal["measure", "category", "timestamp", "counterparty"]
-Window = Literal["all", "day"]
+Window = Literal["all", "day", "hour"]
 _MAX_CATEGORY_LEVELS = 30
 _MAX_SHARE_LEVELS = 15
 _SCALE_CHUNK = 16  # columns of the feature table scaled at a time
@@ -90,7 +90,10 @@ def build_entity_features(
         input: Enriched table artifact (or dataset) with one row per event.
         entity: Entity column (one output row per value).
         time_column: Event time column (enables timestamp, daily and new-counterparty features).
-        windows: "all" (whole period) and/or "day" (daily aggregates: max/mean per day). Default both.
+        windows: "all" (whole period), "day" (daily aggregates: events and measure sums per day) and "hour"
+            (activity per category level: the count of each level, its maximum count in one clock hour and
+            mean count per active hour and, with "day", its maximum and mean count per day).
+            Default "all" and "day"; add "hour" for event logs, to find bursts of one type of event.
         templates: Feature templates to apply. Default all: measure, category, timestamp, counterparty.
     """
     windows = windows or ["all", "day"]
@@ -154,6 +157,13 @@ def build_entity_features(
         t = quote_ident(time_column) if time_column else None
         max_time = con.execute(f"SELECT max({t}) FROM ev").fetchall()[0][0] if t else None
         measures, categories, counterparties = [], [], []
+        expanded: list[tuple[str, str, str]] = []  # (column, level, SQL condition) of the levels with own features
+        # Activity per category level (counts, and counts per hour and per day) is asked for
+        # with the "hour" window. It is not a default: on tables that are not event logs
+        # these features repeat the shares and dilute the others (measured on the
+        # top-up acceptance scenario, where known groups were no longer found).
+        by_level = "hour" in windows
+        warnings: list[str] = []
         for col in candidates:
             q, kind = quote_ident(col), types[col]
             if col in attributes:
@@ -205,13 +215,24 @@ def build_entity_features(
                 )
                 if len(levels) <= _MAX_SHARE_LEVELS:
                     for value, _ in levels:
+                        is_level = f"CAST({q} AS VARCHAR) = '{sql_escape(value)}'"
                         feat(
-                            f"avg((CAST({q} AS VARCHAR) = '{sql_escape(value)}')::DOUBLE)",
+                            f"avg(({is_level})::DOUBLE)",
                             _feature_name(col, "share", value),
                             col,
                             "category",
                             f"share of rows with {col} = {value}",
                         )
+                        if by_level:
+                            # The count says how much, the share only in what proportion.
+                            feat(
+                                f"count(*) FILTER (WHERE {is_level})",
+                                _feature_name(col, "count", value),
+                                col,
+                                "category",
+                                f"number of rows with {col} = {value}",
+                            )
+                            expanded.append((col, value, is_level))
             elif kind == "identifier" and "counterparty" in templates:
                 counterparties.append(col)
             elif kind == "timestamp":
@@ -309,6 +330,57 @@ def build_entity_features(
                 }
                 for m in measures
             ]
+
+        # Per level and per clock hour / day: how many events of one type an entity has in its
+        # busiest bucket and on average. Two steps in the database: counts per (entity,
+        # bucket) with one column per level, then one row per entity. The intermediate
+        # table has at most one row per event; it is checked against features.window_max_rows.
+        cfg = current_run().settings.config.features
+        level_windows = [w for w in ("hour", "day") if t and w in windows and expanded and by_level]
+        if level_windows and len(expanded) > cfg.window_max_levels:
+            warnings.append(
+                f"{len(expanded)} category levels: window features are built for the first "
+                f"{cfg.window_max_levels} only (features.window_max_levels)."
+            )
+        for window in level_windows:
+            levels_used = expanded[: cfg.window_max_levels]
+            bucket = f"date_trunc('hour', {t})" if window == "hour" else f"CAST({t} AS DATE)"
+            counts = ", ".join(f"count(*) FILTER (WHERE {cond}) AS c{i}" for i, (_, _, cond) in enumerate(levels_used))
+            con.execute(
+                f"CREATE TEMP TABLE w_{window} AS SELECT {e}, {bucket} AS b, {counts} FROM ev "
+                f"WHERE {t} IS NOT NULL GROUP BY 1, 2"
+            )
+            n_buckets = con.execute(f"SELECT count(*) FROM w_{window}").fetchall()[0][0]
+            if n_buckets > cfg.window_max_rows:
+                con.execute(f"DROP TABLE w_{window}")
+                warnings.append(
+                    f"The {window} window was skipped: {n_buckets} (entity, {window}) rows exceed "
+                    f"features.window_max_rows ({cfg.window_max_rows}). Filter the events or use the day window."
+                )
+                continue
+            mean_label = "mean_per_active_hour" if window == "hour" else "mean_per_day"
+            unit = "clock hour" if window == "hour" else "day"
+            aggs = []
+            for i, (col, value, _) in enumerate(levels_used):
+                top, mean = _feature_name(col, value, f"max_per_{window}"), _feature_name(col, value, mean_label)
+                aggs += [f"max(c{i}) AS {quote_ident(top)}", f"avg(c{i}) AS {quote_ident(mean)}"]
+                dictionary += [
+                    {
+                        "name": top,
+                        "source": col,
+                        "template": f"window:{window}",
+                        "formula": f"maximum number of rows with {col} = {value} in one {unit}",
+                    },
+                    {
+                        "name": mean,
+                        "source": col,
+                        "template": f"window:{window}",
+                        "formula": f"mean number of rows with {col} = {value} per {unit} with at least one event",
+                    },
+                ]
+            con.execute(f"CREATE TEMP TABLE f_w_{window} AS SELECT {e}, {', '.join(aggs)} FROM w_{window} GROUP BY {e}")
+            con.execute(f"DROP TABLE w_{window}")
+            joins.append(f"f_w_{window}")
 
         if categories and "category" in templates:
             for col in categories:
@@ -422,6 +494,7 @@ def build_entity_features(
             "dictionary": dict_record.id,
         },
         artifact_id=record.id,
+        warnings=warnings,
     )
 
 

@@ -19,7 +19,18 @@ the database. You choose the inputs and parameters; the tools compute.
    resort). Use `entity.column` as the entity and `time_column` as the time.
 2. `build_entity_features(input, entity, time_column)` with the default
    windows and templates. It records the table and the feature dictionary in
-   the spec.
+   the spec. For every category with at most 15 values it gives the share of
+   each value.
+   - **Hourly window.** Use `windows=["all", "day", "hour"]` when the table is an
+     event log with a time column that has hours (not only dates) and a
+     category that says what kind of event a row is (a type, a direction, a
+     channel). It adds, for each value of each category: its **count**, the
+     maximum count in one clock hour, the mean count per active hour, and the
+     maximum and mean count per day. A burst of one type of event in one hour
+     shows there and not in the shares. Leave it out for tables with one row
+     per day or less per entity, and for ledgers handled in step 2b. If the tool
+     warns that a window was skipped (too many rows), continue without it and
+     say so in your summary.
 2b. **Typed events** (a ledger where a type column decides what a row means).
    Do this when `spec.structural_nulls` is not empty. The **type column** is the
    one that appears most often as the determining column there; the **measure**
