@@ -39,7 +39,7 @@ from jellybean.skills._shared.catalog import (
     resolve_source,
     sql_escape,
 )
-from jellybean.skills._shared.column_stats import describe
+from jellybean.skills._shared.column_stats import compute_column_stats, describe
 from jellybean.skills._shared.detection import component_table
 from jellybean.skills._shared.spec_tools import SpecMissingError, patch_spec, read_spec
 from jellybean.skills.feature_engineer._common import (
@@ -82,7 +82,9 @@ def build_entity_features(
 
     Columns are handled by semantic type (from the spec, or inferred). Columns
     constant within each entity (e.g. enrichment attributes such as a segment)
-    are kept as attributes. Grain and partition columns are excluded.
+    are kept as attributes. Partition columns are excluded. Grain columns are
+    used like any other column (the other party, the type and the device of an
+    event are part of its grain); only a technical row id is left out.
 
     Args:
         input: Enriched table artifact (or dataset) with one row per event.
@@ -107,9 +109,20 @@ def build_entity_features(
         partitions: set[str] = set()
         for info in discover_datasets(current_run().settings.data_root).values():
             partitions |= set(info.partition_columns)
-        grain = set(spec.grain.columns) if spec.grain else set()
-        candidates = [c for c in schema if c not in {entity, time_column} | partitions | grain]
+        # Grain columns identify a row, but most of them also describe it (the other party, the
+        # type, the device): they are analysed like any other column. Only a technical row
+        # id is left out: the single column of a unique grain, or an identifier of the
+        # grain with no repeated value.
+        grain = spec.grain
+        grain_columns = [c for c in (grain.columns if grain else []) if c in schema]
+        row_ids = set(grain_columns) if grain and grain.unique and len(grain.columns) == 1 else set()
+        candidates = [c for c in schema if c not in {entity, time_column} | partitions | row_ids]
         types = _semantic_types(spec, con, source.view, candidates)
+        key_ids = [c for c in grain_columns if c in candidates and types[c] == "identifier"]
+        if key_ids:
+            _, key_stats = compute_column_stats(con, source.view, columns=key_ids, with_top=False, with_samples=False)
+            row_ids |= {s.name for s in key_stats if s.non_null and s.distinct == s.non_null}
+            candidates = [c for c in candidates if c not in row_ids]
         e, view = quote_ident(entity), source.view
         # Only the columns the aggregations read are copied (not grain, partition or unused columns).
         used = [entity, *([time_column] if time_column else []), *candidates]
@@ -402,6 +415,7 @@ def build_entity_features(
             "features": n_columns - 1,
             "by_template": by_template,
             "attributes": attributes,
+            "excluded_row_ids": sorted(row_ids),
             "counterparty_columns": counterparties,
             "category_columns": categories,
             "measure_columns": measures,
