@@ -489,7 +489,7 @@ _OP_ORDER = {"fix_units": 0, "flip_sign": 0, "normalize": 1, "cast": 2, "drop_ro
 
 
 @tool
-def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = None) -> ToolResult:
+def propose_cleaning_plan(issues_artifact: str | None = None, skip_issues: list[str] | None = None) -> ToolResult:
     """Propose a justified cleaning plan, operation by operation, from the compiled quality issues.
 
     The plan is stored as an artifact and recorded in the spec (status "proposed").
@@ -498,17 +498,22 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
     shifts, unmatched rows, spikes) are listed with the reason.
 
     Args:
-        issues_artifact: Artifact id from compile_quality_issues.
+        issues_artifact: Artifact id from compile_quality_issues (default: the one recorded in the spec).
+            Without any quality issues the plan is empty: nothing to clean is a valid plan.
         skip_issues: Ids to leave out: issue ids ("Q003") or operation ids of a previous plan ("P02").
     """
     store = _store()
     try:
         spec = read_spec()
-        issues = store.load_json(issues_artifact)["issues"]
+        issues_artifact = issues_artifact or spec.evidence_artifacts.get("quality_issues")
+        issues = store.load_json(issues_artifact)["issues"] if issues_artifact else []
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
     except (ArtifactNotFoundError, FileNotFoundError, KeyError, TypeError):
-        return ToolResult.error(f"'{issues_artifact}' is not a quality-issues artifact.")
+        return ToolResult.error(
+            f"'{issues_artifact}' is not a quality-issues artifact. Pass the id in "
+            "spec.evidence_artifacts.quality_issues, or no id at all to use it (an empty plan when there is none)."
+        )
     skip = set(skip_issues or [])
     # Operation ids (P..) refer to the current plan: translate them into issue ids.
     if any(x.startswith("P") for x in skip) and spec.cleaning_plan.artifact_id:
@@ -704,7 +709,9 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
             return ToolResult.error(f"Internal plan error: {exc}")
         plan_ops.append(PlanOp(id=f"P{n:02d}", **op).model_dump())
     record = store.save_json(
-        "cleaning_plan", {"ops": plan_ops, "not_addressed": not_addressed}, parents=[issues_artifact]
+        "cleaning_plan",
+        {"ops": plan_ops, "not_addressed": not_addressed},
+        parents=[issues_artifact] if issues_artifact else [],
     )
     # A re-proposal keeps `applied_signature`: what was applied stays in effect
     # until a different set of operations is approved and applied.
@@ -808,11 +815,26 @@ def materialize_join(join_index: int = 0, left_artifact: str | None = None) -> T
         spec = read_spec()
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
+    confirmed = [i for i, j in enumerate(spec.joins) if j.status == "confirmed"]
+    if not confirmed and all(j.status == "rejected" for j in spec.joins):
+        # A single dataset, or every join rejected: there is nothing to enrich with.
+        if spec.phase in ("discovery", "cleaning"):
+            patch_spec({"phase": "features"})
+        return ToolResult.ok(
+            {
+                "skipped": True,
+                "reason": "the spec has no confirmed join",
+                "next": "nothing to join: the feature engineer uses the cleaned primary dataset (spec.prepared) "
+                "or, without one, the raw primary dataset",
+            }
+        )
     if not 0 <= join_index < len(spec.joins):
-        return ToolResult.error(f"No join at index {join_index}.")
+        return ToolResult.error(f"No join at index {join_index}. Confirmed joins are at indexes {confirmed}.")
     join = spec.joins[join_index]
     if join.status != "confirmed":
-        return ToolResult.error(f"Join {join_index} is '{join.status}', not confirmed.")
+        return ToolResult.error(
+            f"Join {join_index} is '{join.status}', not confirmed: skip it. Confirmed joins are at indexes {confirmed}."
+        )
     norms = join.key_normalization or ["none"]
     norms = norms * len(join.keys) if len(norms) == 1 else norms
     if not all(is_valid_strategy(n) for n in norms):
@@ -874,7 +896,10 @@ def materialize_join(join_index: int = 0, left_artifact: str | None = None) -> T
     finally:
         con.close()
     if record.row_count != before:
-        return ToolResult.error(f"Join changed the row count ({before} -> {record.row_count}).")
+        return ToolResult.error(
+            f"Join changed the row count ({before} -> {record.row_count}): the right side is not unique on the key. "
+            "Do not use this result: finish with status needs_rework and this reason."
+        )
     patch_spec({"enriched_artifact": record.id, "phase": "features"})
     return ToolResult.ok(
         {

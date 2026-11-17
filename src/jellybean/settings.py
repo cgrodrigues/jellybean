@@ -70,6 +70,8 @@ class LimitsConfig(_Section):
     token_budget_per_run: int = Field(4_000_000, ge=1)
     tool_timeout_s: float = Field(300, gt=0)
     max_rework_cycles: int = Field(2, ge=0)
+    # An agent whose tool calls fail this many times in a row is stopped (it is blocked).
+    max_consecutive_tool_errors: int = Field(6, ge=2)
     # DuckDB resources, per connection (a tool normally opens one). Above the memory
     # limit DuckDB spills to `<run>/tmp` instead of exhausting the machine.
     duckdb_memory_limit: str | None = "4GB"  # null = DuckDB default (80% of RAM)

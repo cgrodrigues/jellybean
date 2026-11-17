@@ -377,19 +377,27 @@ def run_timeseries_anomaly(
         schema = dict(describe(con, source.view))
         for col in [time_column, group_by] + ([] if measure == "count" else [measure]):
             if col and col not in schema:
-                return ToolResult.error(f"Unknown column '{col}'.")
+                return ToolResult.error(f"Unknown column '{col}'. Columns: {list(schema)[:40]}")
         if measure != "count" and type_family(schema[measure]) not in ("integer", "float"):
-            return ToolResult.error(f"Measure '{measure}' is not numeric.")
+            numeric = [c for c, kind in schema.items() if type_family(kind) in ("integer", "float")]
+            return ToolResult.error(
+                f"Measure '{measure}' is not numeric. Use \"count\" or one of the numeric columns: {numeric[:20]}"
+            )
         t, g = quote_ident(time_column), quote_ident(group_by) if group_by else "'__all__'"
         value = "count(*)" if measure == "count" else f"sum({quote_ident(measure)})"
         n_groups = con.execute(f"SELECT count(DISTINCT {g}) FROM {source.view}").fetchall()[0][0]
         n_buckets = con.execute(
             f"SELECT count(DISTINCT date_trunc('{granularity}', {t})) FROM {source.view}"
         ).fetchall()[0][0]
+        if n_buckets == 0:
+            return ToolResult.error(
+                f"No time series can be built: no row has a value in '{time_column}'. Skip the time-series step "
+                "(or use another time column) and continue with the other methods."
+            )
         if n_groups * n_buckets > _MAX_SERIES_POINTS:
             return ToolResult.error(
-                f"{n_groups} groups x {n_buckets} buckets is too many series points; "
-                "group by a lower-cardinality column."
+                f"{n_groups} groups x {n_buckets} buckets is too many series points (limit {_MAX_SERIES_POINTS}). "
+                "Next: group by a column with fewer values, use granularity 'day', or leave group_by out."
             )
         series = con.execute(
             f"SELECT CAST({g} AS VARCHAR) AS \"group\", date_trunc('{granularity}', {t}) AS ts, {value} AS value, "

@@ -199,7 +199,10 @@ def _spec_checks(spec: AnalysisSpec, store: ArtifactStore) -> tuple[list[dict[st
     problems: list[str] = []
     primary = spec.primary()
     if primary is None:
-        problems.append("No primary dataset in the spec.")
+        problems.append(
+            "No primary dataset in the spec. Next: give one dataset the role 'primary' with update_spec "
+            '({"datasets": [{"name": ..., "path": ..., "role": "primary"}, ...]}).'
+        )
         return items, problems
 
     auto_join_keys: set[str] = set()
@@ -237,7 +240,11 @@ def _spec_checks(spec: AnalysisSpec, store: ArtifactStore) -> tuple[list[dict[st
 
     # Entity: top candidate with a clear margin, or the key of an auto-confirmable join.
     if spec.entity is None:
-        problems.append("No entity in the spec.")
+        problems.append(
+            "No entity in the spec. Next: if the profiler has not run propose_spec yet, delegate to it once. If it "
+            "reported that no entity candidate exists, do not delegate again: finish with status needs_human and "
+            "ask the user to run again with --entity <dataset>.<column> (the column that says who a row belongs to)."
+        )
     elif spec.entity.source == "user":
         if spec.entity.dataset != primary.name:
             problems.append(
@@ -289,7 +296,11 @@ def _spec_checks(spec: AnalysisSpec, store: ArtifactStore) -> tuple[list[dict[st
 
     # Grain: must be the top candidate and not merely "near unique".
     if spec.grain is None:
-        problems.append("No grain in the spec.")
+        problems.append(
+            "No grain in the spec. Next: delegate to the profiler once (infer_grain, then propose_spec). If it is "
+            "still missing after that, the table has no key: set it with update_spec "
+            f'({{"grain": {{"dataset": "{primary.name}", "columns": [], "unique": false}}}}) and call this tool again.'
+        )
     else:
         unique = spec.grain.unique
         item = {"item": "grain", "value": spec.grain.columns if unique else spec.grain.label(), "auto": False}
@@ -334,7 +345,7 @@ def prepare_spec_confirmation() -> ToolResult:
     if problems:
         return ToolResult.ok(
             {"ready": False, "problems": problems, "items": items},
-            warnings=["Ask the profiler to complete the proposal first."],
+            warnings=["The proposal is incomplete: each problem says what to do next. Do not loop on the profiler."],
         )
     auto = all(i["auto"] for i in items)
     pending = [i["item"] for i in items if not i["auto"]]

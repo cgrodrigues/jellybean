@@ -113,8 +113,17 @@ so the file is optional.
 The feature tables are never loaded whole to look at one group: the critic and
 the analyst read only the rows of a finding and the columns they need.
 
+- `limits.tool_timeouts` (per tool), `limits.isolate_above_rows` (model fits
+  on more rows run in a worker process that the timeout can kill) and
+  `limits.max_consecutive_tool_errors` (an agent that keeps failing is stopped
+  and reports what blocked it).
+
 What is still expensive on large data is listed in
-[docs/performance-audit.md](docs/performance-audit.md).
+[docs/performance-audit.md](docs/performance-audit.md). The fields of
+`spec.yaml`, including a grain with **no unique key** and the feature windows,
+are in [docs/spec-reference.md](docs/spec-reference.md); how every mandatory
+step exits when its input is missing is in
+[docs/dead-end-audit.md](docs/dead-end-audit.md).
 
 ## Dataset notes (README.md per dataset)
 

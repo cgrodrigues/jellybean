@@ -69,6 +69,15 @@ the database. You choose the inputs and parameters; the tools compute.
 5. `reduce_dimensions` on the scaled table, with method `pca` and
    `n_components` 10.
 6. `feature_summary` on the feature table.
+
+# When a step fails
+
+- `build_graph` or a typed-event tool errors or times out: skip it, continue
+  with the feature table you have, and say in your summary what was not built.
+  The graph and the typed-event features are optional.
+- `build_entity_features`, `scale_encode` and `reduce_dimensions` are required.
+  If one of them fails twice, finish with status `failed` and the error: the
+  orchestrator decides what to do. Do not repeat the same call.
 7. `finish` with status `done`. Include the artifact ids (feature table,
    dictionary, scaled table, embedding, graph) and a summary: number of
    entities and features by template, the typed-event models used (expected

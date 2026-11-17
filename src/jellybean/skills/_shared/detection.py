@@ -244,6 +244,9 @@ def cluster_labels_local(
     if method == "hdbscan":
         from sklearn.cluster import HDBSCAN
 
+        if len(X) < 2 * int(params.get("min_cluster_size", 10)):
+            # Too few entities to form two clusters: "no cluster" is the result, not an error.
+            return np.full(len(X), -1, dtype=int)
         model = HDBSCAN(
             min_cluster_size=int(params.get("min_cluster_size", 10)), min_samples=params.get("min_samples"), copy=True
         )
@@ -258,12 +261,13 @@ def cluster_labels_local(
     if method == "kmeans":
         from sklearn.cluster import KMeans
 
-        return KMeans(n_clusters=int(params.get("n_clusters", 12)), n_init=10, random_state=seed).fit_predict(X)
+        k = max(1, min(int(params.get("n_clusters", 12)), len(X)))  # never more clusters than entities
+        return KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(X)
     if method == "gmm":
         from sklearn.mixture import GaussianMixture
 
         model = GaussianMixture(
-            n_components=int(params.get("n_components", 12)),
+            n_components=max(1, min(int(params.get("n_components", 12)), len(X))),
             random_state=seed,
             covariance_type=params.get("covariance_type", "diag"),
         )

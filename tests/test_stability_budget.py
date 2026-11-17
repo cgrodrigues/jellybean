@@ -113,3 +113,21 @@ def test_report_says_when_stability_was_not_measured(tight_budget: RunContext, m
     _slow_redetect(30.0, monkeypatch)
     cr.stability_check(f.id)
     assert "stability not measured" in build_report(tight_budget)
+
+
+def test_artifact_check_that_cannot_finish_does_not_block_the_verdict(
+    run_copy: RunContext,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    f = next(x for x in all_findings() if x.type != "temporal")
+    import time
+
+    monkeypatch.setattr(run_copy.settings.config.limits, "tool_timeouts", {"artifact_check": 0.5})
+    monkeypatch.setattr(cr, "connect", lambda *a, **k: time.sleep(3))  # the scan of the dataset never comes back
+    assert cr.artifact_check(f.id).summary.get("timed_out") is True
+    check = load_finding(f.id).checks["artifact"]
+    assert check["measured"] is False and check["suspected"] is False
+    refused = cr.set_verdict(f.id, "confirmed", {"x": 1})
+    assert refused.status == "error" and "artifact check was not measured" in refused.summary["error"]
+    assert cr.set_verdict(f.id, "weak", {"note": "artifact check timed out"}).status == "ok"
+    assert "not measured" in load_finding(f.id).critic_evidence["evidence"]["artifact"]

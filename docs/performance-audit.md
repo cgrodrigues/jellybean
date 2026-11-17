@@ -198,6 +198,20 @@ loading and plotting. A smaller sample finds fewer small clusters (a group needs
 
 **Not verified here:** the 592,282-entity table is not on the development machine.
 
+## Hourly window of the feature engineer
+
+`build_entity_features(windows=[..., "hour"])` adds counts per category level and their
+maximum and mean per clock hour and per day. It does not build an entity x hour x level
+table: the first step groups the events by (entity, hour) with one count column per level,
+the second reduces that to one row per entity, both in DuckDB.
+
+- **Size of the intermediate table:** one row per (entity, active hour), so never more
+  than the number of events. For 2 million entities active in 100 hours each that is
+  200 million rows of a few integers; it spills to disk under `limits.duckdb_memory_limit`.
+- **Caps:** `features.window_max_rows` (200 million rows; above it the window is skipped
+  with a warning) and `features.window_max_levels` (60 levels over all columns).
+- **Not measured** on the real data.
+
 ## Medium and low findings (follow-ups)
 
 | Risk | File | Line | Function | Problem | Proposed fix |

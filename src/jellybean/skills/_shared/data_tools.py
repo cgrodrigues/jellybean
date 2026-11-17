@@ -65,9 +65,28 @@ def list_datasets() -> ToolResult:
     Returns per dataset the number of files, number of rows, size on disk,
     Hive partition columns and whether a README.md with notes exists.
     """
-    datasets = discover_datasets(_settings().data_root)
+    root = _settings().data_root
+    datasets = discover_datasets(root)
+    # Folders with Parquet files whose name cannot be a table name are not datasets: say so.
+    skipped = (
+        sorted(
+            p.name
+            for p in root.iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_")) and p.name not in datasets and any(p.rglob("*.parquet"))
+        )
+        if root.is_dir()
+        else []
+    )
+    unusable = (
+        [
+            f"Folders not usable as datasets (rename them: letters, digits and '_' only, starting with a letter): "
+            f"{skipped}"
+        ]
+        if skipped
+        else []
+    )
     if not datasets:
-        return ToolResult.ok({"datasets": []}, warnings=["No datasets found in the data root."])
+        return ToolResult.ok({"datasets": []}, warnings=["No datasets found in the data root.", *unusable])
     con = connect()
     try:
         items = []
@@ -85,7 +104,7 @@ def list_datasets() -> ToolResult:
             )
     finally:
         con.close()
-    return ToolResult.ok({"datasets": items})
+    return ToolResult.ok({"datasets": items}, warnings=unusable)
 
 
 @tool

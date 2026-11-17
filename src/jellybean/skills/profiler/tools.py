@@ -1563,8 +1563,7 @@ def propose_spec(
             else {"dataset": grain_doc["dataset"], "columns": [], "unique": False}
         )
         ent_doc = _load_kind(store, entities, "candidates")
-        if not ent_doc["candidates"]:
-            return ToolResult.error(f"Entities artifact '{entities}' has no candidates.")
+        no_entity = not ent_doc["candidates"]
         columns: dict[str, dict[str, str]] = {}
         typed = [(_load_kind(store, a, "columns"), a) for a in semantic_types]
         all_names = [name for doc, _ in typed for name in doc["columns"]]
@@ -1576,15 +1575,19 @@ def propose_spec(
         patch: dict[str, Any] = {
             "joins": joins,
             "grain": grain_patch,
-            "entity": {
+            "entity": None
+            if no_entity
+            else {
                 "column": ent_doc["candidates"][0]["column"],
                 "alternatives": [c["column"] for c in ent_doc["candidates"][1:4]],
             },
             "columns": columns,
             "evidence_artifacts": evidence,
         }
-        if spec.entity is not None and spec.entity.source == "user":
-            patch.pop("entity")  # fixed by the user with --entity: never overwritten
+        if no_entity or (spec.entity is not None and spec.entity.source == "user"):
+            # Fixed by the user with --entity (never overwritten), or no candidate found: the
+            # rest of the proposal is still written and the entity is asked at control 1.
+            patch.pop("entity")
         if temporal:
             patch["time_column"] = _load_kind(store, temporal, "time_column")["time_column"]
             evidence["temporal"] = temporal
@@ -1653,4 +1656,9 @@ def propose_spec(
     except ValueError as exc:
         return ToolResult.error(f"Proposal rejected: {exc}"[:1500])
     warnings = [f"Not recorded in the spec (their issues are in the quality issues): {ignored}"] if ignored else []
+    if no_entity and new_spec.entity is None:
+        warnings.append(
+            "No entity candidate was found, so the spec has no entity: the rest of the proposal was written. "
+            "Say so in your summary; the orchestrator will ask the user for it. Do not invent one."
+        )
     return ToolResult.ok({"proposed": sorted(patch), "spec": new_spec.compact_summary()}, warnings=warnings)

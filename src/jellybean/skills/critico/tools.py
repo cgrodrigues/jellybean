@@ -564,6 +564,11 @@ def _null_shares_by_reading(path: Any) -> dict[str, float]:
     return {name: table.column(name).null_count / table.num_rows for name in table.column_names}
 
 
+def _artifact_unmeasured(reason: str) -> dict[str, Any]:
+    """Record of an artifact check that was attempted and could not be measured."""
+    return {"suspected": False, "measured": False, "reason": reason, "reasons": [], "associations": []}
+
+
 def _association(name: str, finding_share: float, population_share: float, cfg: Any, **extra: Any) -> dict[str, Any]:
     lift = finding_share / population_share if population_share > 0 else (np.inf if finding_share > 0 else 1.0)
     suspicious = finding_share >= cfg.artifact_min_share and lift >= cfg.artifact_min_lift
@@ -654,6 +659,9 @@ def artifact_check(finding: str) -> ToolResult:
     entity = spec.entity.column if spec.entity else None
     associations: list[dict[str, Any]] = []
     reasons: list[str] = []
+    # Recorded as attempted before any work: a check that is stopped at the tool limit, or
+    # that cannot measure, must not leave the finding without a possible verdict.
+    _record_check(f, "artifact", _artifact_unmeasured("timeout"))
     con = connect()
     try:
         con.execute(f"CREATE TEMP VIEW src AS SELECT * FROM {relation}")
@@ -699,7 +707,15 @@ def artifact_check(finding: str) -> ToolResult:
             facts["rows"], facts["nulls"] = pop_row[0], dict(zip(columns, pop_row[1:], strict=True))
         n_pop = facts["rows"]
         if n_fin == 0:
-            return ToolResult.error("The finding matches no rows of the primary dataset.")
+            unmeasured = _artifact_unmeasured("the finding matches no rows of the primary dataset")
+            _record_check(f, "artifact", unmeasured)
+            return ToolResult.ok(
+                {"finding": f.id, **unmeasured},
+                warnings=[
+                    "The artifact check could not be measured: the finding matches no rows of the primary dataset. "
+                    "Do not repeat it; the verdict can be 'weak' or 'unstable', not 'confirmed' or 'explained'."
+                ],
+            )
 
         # 1) Source file concentration (entity findings only: temporal windows are trivially in their day file).
         if f.type != "temporal":
@@ -861,7 +877,7 @@ def artifact_check(finding: str) -> ToolResult:
             )
     suspected = bool(reasons)
     top = sorted(associations, key=lambda a: (-a["suspicious"], -a["lift"] * a["finding_share"]))[:8]
-    result = {"suspected": suspected, "reasons": reasons[:8], "associations": top}
+    result = {"suspected": suspected, "measured": True, "reasons": reasons[:8], "associations": top}
     if f.type != "temporal" and "n_events" in raw_columns:
         result["low_support_share"] = round(low_support_share, 4)
     _record_check(f, "artifact", result)
@@ -1392,6 +1408,15 @@ def set_verdict(finding: str, verdict: Verdict, evidence: dict[str, Any]) -> Too
             f"Run {missing} before setting a verdict (call each once; a check that cannot measure records why "
             "and still allows a verdict)."
         )
+    if f.checks["artifact"].get("measured") is False:
+        # Attempted but not measured: nothing says the finding is clean of data artefacts.
+        why = f.checks["artifact"].get("reason", "unknown")
+        if verdict not in ("weak", "unstable"):
+            return ToolResult.error(
+                f"The artifact check was not measured ({why}): the verdict cannot be '{verdict}'. Use 'weak' or "
+                "'unstable'. Do not run artifact_check again with the same arguments."
+            )
+        evidence = {**evidence, "artifact": f"not measured ({why})"}
     stability = f.checks["stability"].get("stability")
     if stability is None and not f.checks["artifact"]["suspected"]:
         # Attempted but not measured (timeout, no members): the finding still gets a verdict,

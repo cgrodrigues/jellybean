@@ -28,6 +28,7 @@ profiling:                         # keeps the profiler's checks cheap on large 
 
   # tool_timeouts:                 # timeout of single tools, overriding tool_timeout_s
   #   run_clustering: 900
+  max_consecutive_tool_errors: 6   # an agent whose tool calls fail this many times in a row is stopped as blocked
   isolate_above_rows: 20000        # model fits on more rows run in a worker process, killed at the timeout (null = never)
 
 features:
