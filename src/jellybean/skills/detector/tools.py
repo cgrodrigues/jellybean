@@ -187,7 +187,8 @@ def run_clustering(
     Args:
         features: Embedding or scaled feature table.
         method: hdbscan (default parameters: min_cluster_size 10), gmm or kmeans.
-        params: Method parameters, e.g. {"min_cluster_size": 10} or {"n_clusters": 12}.
+        params: Method parameters, e.g. {"min_cluster_size": 10} or {"n_clusters": 12}. For hdbscan,
+            {"max_rows": 50000} fits on a smaller seeded sample (use it after a timeout).
         seed: Random seed (defaults to the run seed).
     """
     cfg = _cfg()
@@ -623,18 +624,27 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     """
     cfg = _cfg()
     store = _store()
-    try:
-        runs = [(rid, store.get(rid)) for rid in run_ids]
-    except ArtifactNotFoundError as exc:
-        return ToolResult.error(f"Unknown run: {exc}")
+    # A method that failed or timed out left no run: ids that are not detection runs of
+    # this run are left out and reported, they do not stop the consolidation.
+    runs, ignored = [], []
+    for rid in dict.fromkeys(run_ids):
+        if store.exists(rid) and store.get(rid).params.get("kind"):
+            runs.append((rid, store.get(rid)))
+        else:
+            ignored.append(rid)
     kinds: dict[str, list[tuple[str, Any]]] = {}
     for rid, record in runs:
         kind = record.params.get("kind")
-        if kind is None:
-            return ToolResult.error(f"'{rid}' is not a detection run.")
         kinds.setdefault(kind, []).append((rid, record))
     if len(kinds.get("outlier", [])) < 2 or not kinds.get("cluster"):
-        return ToolResult.error("Use at least two outlier methods and one clustering method before consolidating.")
+        have = {k: len(v) for k, v in kinds.items()}
+        return ToolResult.error(
+            "Consolidation needs at least two outlier runs and one clustering run. "
+            f"Valid runs given: {have or 'none'}"
+            + (f"; not detection runs of this run (failed or timed out?): {ignored}" if ignored else "")
+            + ". Next: for outliers run run_outlier_detector with isolation_forest and ecod; for clustering run "
+            'run_clustering with method "kmeans" (it always finishes), then call consolidate_findings again.'
+        )
     try:
         source = feature_source()
     except SpecMissingError as exc:
@@ -644,6 +654,8 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     n_entities = source.n_rows()
     candidates: list[dict[str, Any]] = []
     warnings: list[str] = []
+    if ignored:
+        warnings.append(f"Ignored (not detection runs of this run; a failed or timed-out call leaves none): {ignored}")
 
     def space_of(pool: list[Any], columns: list[str] | None = None) -> pd.DataFrame:
         """Scaled features of the pooled entities only (the grouping reads no other row)."""

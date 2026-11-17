@@ -49,9 +49,34 @@ them for the consolidation.
      activity per entity: `measure="count"`, `group_by=<the entity>`,
      `granularity="day"`. Each entity is compared with its own active life and
      with the bursts of the others.
-7. `consolidate_findings` with **all** the run ids from the steps above.
+7. `consolidate_findings` with the run ids of the steps above **that
+   succeeded**. A call that returned an error or timed out produced no run:
+   leave it out.
 8. `finish` with status `done`. List the findings (id, type, size, methods) and
-   the run ids.
+   the run ids, and list every method that was **not run** (which one and why:
+   timed out, error).
+
+# When a method fails or times out
+
+A call that timed out is never repeated with the same arguments: the runtime
+refuses it. Follow this order, then move on:
+
+- `run_clustering` with `hdbscan` timed out: call it once more with a smaller
+  sample, `params={"max_rows": 50000}` (then `20000`). If that fails too, use
+  `method="kmeans"` (or `"gmm"`), which always finish. One clustering run is
+  enough to consolidate.
+- `run_outlier_detector` with `lof` timed out: continue with `isolation_forest`
+  and `ecod` (and `hbos` if you need a third method). Two outlier methods are
+  enough to consolidate.
+- `run_timeseries_anomaly` errors: read the message. For "too many series
+  points" choose a `group_by` with fewer values or `granularity="day"`; for an
+  unknown or non-numeric column choose another measure. A result with
+  `anomalous_points: 0` is a valid result, not a failure: keep its run id.
+- `run_graph_analysis` or `run_contextual_outliers` fail: skip them, they are
+  optional.
+
+Report a method that could not be run as "not run" in your summary. Do not
+retry it in other ways and do not stop the detection because of it.
 
 # Rules
 

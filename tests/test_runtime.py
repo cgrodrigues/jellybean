@@ -294,3 +294,26 @@ def test_agents_receive_the_context_notes(run_ctx: RunContext) -> None:
     first = llm.calls[0]
     assert "amount is in EUR" in first.messages[0].content  # spec summary at the start of the task
     assert "# Context notes" in first.system  # the skill says how to use them
+
+
+# ------------------------------------------------------- repeated timed-out calls
+def test_a_call_that_timed_out_is_not_executed_again(run_ctx: RunContext) -> None:
+    run_ctx.settings.config.limits.tool_timeouts = {"list_datasets": 0.0001}
+    script = {
+        "profiler": [
+            call("list_datasets"),
+            call("list_datasets"),  # identical: refused without running
+            call("get_schema", dataset_or_artifact="events"),  # another call still runs
+            FINISH,
+        ]
+    }
+    llm = FakeLLM(script)
+    result = Runtime(ctx=run_ctx, llm=llm).run_agent("profiler", "t")
+    assert result.status == "done"
+    first, second = llm.calls[1].messages[-1].content, llm.calls[2].messages[-1].content
+    assert "timed out" in first and '"timed_out":true' in first.replace(" ", "")
+    assert "Not run" in second and "Change the arguments" in second
+    events = [json.loads(line) for line in run_ctx.trace_path.read_text(encoding="utf-8").splitlines()]
+    calls = [e for e in events if e["kind"] == "tool_call" and e["tool"] == "list_datasets"]
+    assert len(calls) == 2 and calls[1]["duration_s"] == 0.0  # the second one never reached the tool
+    assert '"status":"ok"' in llm.calls[3].messages[-1].content.replace(" ", "")

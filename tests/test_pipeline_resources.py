@@ -429,3 +429,13 @@ def test_planted_anomalies_are_judged_against_a_sample(run_copy: RunContext, mon
     result = cr.inject_synthetic_anomalies(features, n=5)
     assert result.status == "ok" and any("sample of 2000" in w for w in result.warnings)
     assert result.summary["detected_by_2_plus"] >= full.summary["detected_by_2_plus"] - 0.2
+
+
+def test_consolidation_ignores_runs_that_do_not_exist(run_copy: RunContext, phase5: dict) -> None:
+    from jellybean.skills.detector import tools as det
+
+    result = det.consolidate_findings([*phase5["runs"], "detection_hdbscan_v9", "features_scaled_v1"])
+    assert result.status == "ok"
+    assert any("detection_hdbscan_v9" in w and "features_scaled_v1" in w for w in result.warnings)
+    missing = det.consolidate_findings(["detection_hdbscan_v9"])
+    assert missing.status == "error" and "kmeans" in missing.summary["error"]

@@ -197,6 +197,8 @@ class AgentRunner:
         self.max_iterations = skill.max_iterations or limits.max_iterations_per_agent
         self.tools = runtime.registry.tools_for(skill.name)
         self.tools[FINISH_TOOL] = FINISH_SPEC
+        # Calls (tool + arguments) that timed out in this agent run: never executed again.
+        self._timed_out: set[tuple[str, str]] = set()
 
     def _system_prompt(self) -> str:
         return self.skill.system_prompt.rstrip() + RUNTIME_RULES
@@ -221,7 +223,19 @@ class AgentRunner:
             return self._rejected(name, {}, f"Unknown tool '{name}'. Available: {sorted(self.tools)}")
         if not isinstance(arguments, dict):
             return self._rejected(name, {}, "Tool arguments must be a JSON object.")
-        return spec.func(**arguments)
+        key = (name, json.dumps(arguments, sort_keys=True, default=str))
+        if key in self._timed_out:
+            return self._rejected(
+                name,
+                arguments,
+                f"Not run: this exact call to '{name}' already timed out in this task and would time out again. "
+                "Change the arguments (a smaller sample or fewer rows through the tool's parameters, fewer "
+                "columns, another method), or continue without it and report it as not run.",
+            )
+        result = spec.func(**arguments)
+        if result.status == "error" and result.summary.get("timed_out"):
+            self._timed_out.add(key)
+        return result
 
     @staticmethod
     def _rejected(name: str, arguments: dict[str, Any], message: str) -> ToolResult:
