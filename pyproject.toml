@@ -1,8 +1,14 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 [project]
 name = "jellybean"
 version = "0.1.0"
 description = "Multi-agent PoC that finds anomalies and patterns in Parquet datasets without exposing raw data to the LLM."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Carlos Rodrigues" }]
 requires-python = "==3.12.*"
 dependencies = [
     "duckdb>=2.0.0",
@@ -25,6 +31,11 @@ dependencies = [
     "statsmodels>=0.15.0",
     "typer>=0.29.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/cgrodrigues/jellybean"
+Changelog = "https://github.com/cgrodrigues/jellybean/blob/main/CHANGELOG.md"
+Issues = "https://github.com/cgrodrigues/jellybean/issues"
 
 [project.scripts]
 jellybean = "jellybean.cli:app"
@@ -71,3 +82,9 @@ extend-exclude = ["*.md"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.bandit]
+# B608/B610: SQL is built as text for an in-process, sandboxed DuckDB. Identifiers go
+# through quote_ident, literals through sql_escape, and agent-written SQL through the
+# SQL guard (skills/_shared/sql_guard.py); bandit cannot see any of that.
+skips = ["B608", "B610"]

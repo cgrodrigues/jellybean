@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 # ruff: noqa: E501  (long SQL assertions read better on one line)
 """Top-up ledger generator (requirements_2.md): sizes, invariants, anomalies and ground truth.
 

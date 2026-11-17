@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Critic tools (spec section 7.6).
 
 The critic tries to **refute** each finding, in an isolated context: it gets

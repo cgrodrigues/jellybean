@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Column statistics and rule-based semantic typing, computed inside DuckDB.
 
 These helpers are pure functions over an open connection and a view name. They

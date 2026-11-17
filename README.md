@@ -1,5 +1,21 @@
 <h1><img src="docs/assets/jellybean.svg" alt="Jellybean logo" width="64" align="middle"> Jellybean</h1>
 
+[![CI](https://github.com/cgrodrigues/jellybean/actions/workflows/ci.yml/badge.svg)](https://github.com/cgrodrigues/jellybean/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![uv](https://img.shields.io/badge/packaging-uv-DE5FE9.svg)](https://docs.astral.sh/uv/)
+[![Ruff](https://img.shields.io/badge/linting-ruff-261230.svg)](https://docs.astral.sh/ruff/)
+[![pytest](https://img.shields.io/badge/tests-pytest-0A9EDC.svg)](https://docs.pytest.org/)
+[![gitleaks](https://img.shields.io/badge/secrets-gitleaks-blue.svg)](https://github.com/gitleaks/gitleaks)
+[![pip-audit](https://img.shields.io/badge/dependencies-pip--audit-blue.svg)](https://github.com/pypa/pip-audit)
+[![Bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://github.com/PyCQA/bandit)
+[![Dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C.svg?logo=dependabot)](.github/dependabot.yml)
+[![DuckDB](https://img.shields.io/badge/engine-DuckDB-FFF000.svg)](https://duckdb.org/)
+[![LangChain](https://img.shields.io/badge/LLM-LangChain-1C3C3C.svg)](https://www.langchain.com/)
+[![Changelog](https://img.shields.io/badge/changelog-Keep%20a%20Changelog-E05735.svg)](CHANGELOG.md)
+[![Cite](https://img.shields.io/badge/cite-CITATION.cff-green.svg)](CITATION.cff)
+[![Status: proof of concept](https://img.shields.io/badge/status-proof%20of%20concept-orange.svg)](#principles)
+
 Proof of concept of a **multi-agent team** that receives a natural-language
 instruction (e.g. *"analyzes the data in the traffic and enriches it with
 cost_segmentation"*), loads Parquet datasets through DuckDB, discovers how to
@@ -699,3 +715,13 @@ tools, the shared tools it declares and `finish`, and the orchestrator can
 `delegate` to it. Every agent run starts from a clean context (system prompt,
 spec summary, task and artifact ids) and returns `status`, `summary`,
 `artifact_ids`, `issues` and `requests`.
+
+## License, authors and citation
+
+Jellybean is licensed under the [Apache License 2.0](LICENSE); see also
+[NOTICE](NOTICE) and [AUTHORS](AUTHORS). Source files carry an SPDX header
+(`SPDX-License-Identifier: Apache-2.0`).
+
+To cite the project, use [CITATION.cff](CITATION.cff) (GitHub shows a
+"Cite this repository" button from it). Changes are recorded in
+[CHANGELOG.md](CHANGELOG.md).

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Row filters (`jellybean run --filter`): parsing, validation and application to every dataset view."""
 
 from __future__ import annotations

@@ -1,0 +1,27 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Jellybean: a multi-agent team that finds anomalies in Parquet datasets without exposing the data to the LLM"
+abstract: >-
+  Proof of concept of a multi-agent team that receives a natural-language
+  instruction, loads Parquet datasets through DuckDB, discovers how to join
+  them, cleans them, builds features and runs unsupervised machine learning to
+  find anomalies and patterns, without putting the data into the LLM context.
+authors:
+  - family-names: Rodrigues
+    given-names: Carlos
+repository-code: "https://github.com/cgrodrigues/jellybean"
+url: "https://github.com/cgrodrigues/jellybean"
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-11-12"
+keywords:
+  - anomaly detection
+  - multi-agent systems
+  - large language models
+  - DuckDB
+  - Parquet
+  - unsupervised learning

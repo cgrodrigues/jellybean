@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Evaluation of a run against the dummy-data ground truth (spec section 10).
 
 ``scripts/evaluate_run.py <run_id>`` (or ``jellybean evaluate <run_id>``)

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Live progress of a run in the terminal.
 
 The console view listens to the trace events (see :mod:`tracing`) and prints a

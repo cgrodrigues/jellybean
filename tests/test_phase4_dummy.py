@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 4 verification on the dummy data, without an LLM.
 
 Runs the deterministic tool chain profiler -> control 1 -> cleaning plan ->

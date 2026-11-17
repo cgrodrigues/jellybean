@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Feature models for typed events and the flip_sign fix (requirements_2.md, phase 4).
 
 Runs discovery (as in test_topup_discovery), approves the whole cleaning plan

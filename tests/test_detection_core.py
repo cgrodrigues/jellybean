@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Detection helpers that must hold for any domain (found with an independent telemetry dataset)."""
 
 from __future__ import annotations

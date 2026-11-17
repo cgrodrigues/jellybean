@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Contract tests: every shared tool returns a valid ToolResult within limits.
 
 Each tool is called with ordinary and with deliberately oversized requests.

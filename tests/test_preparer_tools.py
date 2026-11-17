@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for preparer tools over the small fixtures (see conftest.py)."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """LLM client interface, the LangChain implementation and a scripted FakeLLM.
 
 The runtime talks to models only through :class:`LLMClient`, using small

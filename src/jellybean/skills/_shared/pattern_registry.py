@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Persistent pattern registry (spec section 8), shared across runs.
 
 Stored in ``workspace/pattern_registry/registry.json`` and indexed by the

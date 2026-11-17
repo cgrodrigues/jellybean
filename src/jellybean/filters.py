@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Row filters for a run (``jellybean run --filter "<dataset>.<column> ..."``).
 
 A filter is a SQL boolean condition whose columns are prefixed with the dataset

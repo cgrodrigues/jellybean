@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Static validation of SQL submitted by agents.
 
 This is the first of two defence layers for ``run_sql`` (the second is the

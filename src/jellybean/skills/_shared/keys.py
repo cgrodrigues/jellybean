@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Join-key normalisation strategies.
 
 A strategy is a named, deterministic SQL transformation applied to a key column

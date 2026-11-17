@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """LLMClient tests: message conversion, provider construction, FakeLLM. No network calls."""
 
 from __future__ import annotations

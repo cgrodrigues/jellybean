@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Live progress view: rendering of trace events, CLI integration, generator steps."""
 
 from __future__ import annotations

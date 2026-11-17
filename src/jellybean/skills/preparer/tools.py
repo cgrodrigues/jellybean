@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Preparer tools (spec section 7.3).
 
 The preparer proposes a justified cleaning plan from the profiler's quality

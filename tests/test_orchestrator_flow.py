@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Orchestrator tools, human control point 1 and a scripted end-to-end run (FakeLLM)."""
 
 from __future__ import annotations

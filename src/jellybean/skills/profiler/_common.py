@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Helpers shared by the profiler's tool modules (``tools.py`` and ``integrity.py``)."""
 
 from __future__ import annotations

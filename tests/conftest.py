@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared pytest fixtures: isolated settings, small Parquet fixtures, an active run."""
 
 from __future__ import annotations

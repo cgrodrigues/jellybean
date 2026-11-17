@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Detection algorithms shared by the detector (first run) and the critic (re-runs).
 
 Every function is deterministic for a given seed and works on the per-entity

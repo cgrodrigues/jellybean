@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared data tools available to every agent that declares them (spec section 5).
 
 All tools return small summaries; raw rows (at most ``max_raw_rows``) are
