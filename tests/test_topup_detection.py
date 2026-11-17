@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Detection and critique on the top-up ledger, one analysis per entity (requirements_2.md, phase 5).
 
 On top of discovery and cleaning (as in test_topup_features), each entity is

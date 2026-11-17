@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Unknown-domain test: the system must work on data it was never designed for.
 
 The data comes from ``scripts/generate_unknown_domain.py`` (industrial machine

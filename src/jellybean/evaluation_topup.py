@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Evaluation of a top-up run against its ground truth (``requirements_2.md`` section 11).
 
 One analysis studies one entity, so a run measures the anomalies of its entity

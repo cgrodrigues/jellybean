@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Cancellation of a running tool call (timeout, Ctrl+C).
 
 Python threads cannot be killed, so a tool that reaches its timeout has to be

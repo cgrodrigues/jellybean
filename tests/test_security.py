@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Security tests for run_sql / sample_rows: read-only, sandboxed, no ground truth."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Runtime tests with FakeLLM: loader, registry, loop, delegation and context isolation."""
 
 from __future__ import annotations

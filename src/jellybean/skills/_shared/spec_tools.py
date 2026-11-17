@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared tools to read and update ``spec.yaml`` (written by orchestrator and profiler).
 
 Every update is a validated patch (see :func:`jellybean.spec.apply_patch`);

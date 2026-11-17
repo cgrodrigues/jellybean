@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate the dummy datasets (spec section 9) or the unknown-domain dataset.
 
 Thin wrapper around ``jellybean generate-data`` (same options):

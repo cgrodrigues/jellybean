@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Short README.md texts written into each dataset folder with ``--with-readme``.
 
 They describe column meanings only (no hints about planted anomalies), to test

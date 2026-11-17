@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Detector tools (spec section 7.5).
 
 Runs several unsupervised methods on the per-entity features (and the event

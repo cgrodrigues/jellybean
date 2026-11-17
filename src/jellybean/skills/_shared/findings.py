@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Findings: candidate anomalies/patterns and their lifecycle (spec section 6).
 
 A finding is a JSON record in ``workspace/<run_id>/findings/<id>.json`` with a

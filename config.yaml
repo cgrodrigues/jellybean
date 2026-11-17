@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 # Jellybean limits and thresholds. Every value has a default in
 # `src/jellybean/settings.py`; this file documents and overrides them.
 

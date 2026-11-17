@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Dataset discovery and DuckDB connections.
 
 A *dataset* is any sub-folder of the data root that contains Parquet files, at

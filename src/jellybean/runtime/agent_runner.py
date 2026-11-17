@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Agent runtime: the tool-use loop, delegation, token budget (spec section 4).
 
 * :class:`Runtime` holds what is shared by every agent of a run: skills, tool

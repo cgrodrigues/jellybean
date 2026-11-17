@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Analyst tools (spec section 7.7).
 
 Describe confirmed findings in understandable terms: the features that differ

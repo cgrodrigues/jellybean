@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Schema of ``spec.yaml``: the analysis specification and source of truth of a run.
 
 The spec is written by the orchestrator and the profiler and read by every

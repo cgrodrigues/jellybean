@@ -1,0 +1,9 @@
+Jellybean
+Copyright 2026 Carlos Rodrigues
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on third-party open-source packages (DuckDB, LangChain, pandas,
+NumPy, PyArrow, scikit-learn, PyOD, statsmodels, NetworkX, Matplotlib,
+Pydantic, Typer and others), which are not distributed with this source code
+and keep their own licenses. The full list is in pyproject.toml and uv.lock.

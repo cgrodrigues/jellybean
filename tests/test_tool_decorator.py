@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the @tool decorator and ToolResult contract."""
 
 from __future__ import annotations

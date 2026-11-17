@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Skill discovery: turns ``skills/*/SKILL.md`` into agent definitions.
 
 A SKILL.md is YAML front matter followed by Markdown. The front matter holds

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Memory and CPU bounds of the stages after the profiler (features, detection, critic, analyst).
 
 Two kinds of tests: the bounded code paths give the same result as the simple

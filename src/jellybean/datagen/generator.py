@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Synthetic telecom/e-commerce data with planted anomalies (spec section 9).
 
 Produces Parquet datasets under ``out`` and the ground truth under ``truth``

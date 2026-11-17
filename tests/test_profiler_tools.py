@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for profiler tools over the small fixtures (see conftest.py).
 
 Fixture recap: ``events.phone`` is ``+35191`` + 7 digits (50 distinct values) and

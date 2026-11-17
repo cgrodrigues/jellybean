@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Append-only JSONL tracing (``workspace/<run_id>/logs/trace.jsonl``).
 
 One line per LLM call (tokens, duration) and per tool call (arguments, output

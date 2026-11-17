@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Prepaid top-up ledger with planted anomalies (``requirements_2.md``).
 
 One row per movement on a customer's wallet (``topup``, partitioned by

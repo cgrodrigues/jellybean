@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Overview plots of a run: cluster maps and the findings map.
 
 Both use the same 2D projection of the entities: the first two components of

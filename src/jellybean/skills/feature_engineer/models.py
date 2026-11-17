@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 # ruff: noqa: E501  (SQL templates are kept on one line each, to read as SQL)
 """Feature models for ledgers of typed events (``requirements_2.md`` section 10.4).
 

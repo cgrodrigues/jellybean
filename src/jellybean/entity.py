@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """The analysis entity chosen by the user (``jellybean run --entity <dataset>.<column>``).
 
 Every analysis is about one entity: the "who" that rows belong to (a customer,

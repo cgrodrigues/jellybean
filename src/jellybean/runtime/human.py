@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Human-in-the-loop: interactive console questions and auto-approve mode.
 
 ``ask_human`` (an orchestrator tool) delegates to the active

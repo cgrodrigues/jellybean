@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Command line interface (``jellybean ...``).
 
 Commands: ``generate-data``, ``datasets``, ``run``, ``resume``, ``report``,

@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """The analysis entity chosen by the user (`jellybean run --entity <dataset>.<column>`)."""
 
 from __future__ import annotations

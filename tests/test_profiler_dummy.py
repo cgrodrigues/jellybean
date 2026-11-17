@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 2 verification: profiler tools find the right spec on the dummy data, without an LLM.
 
 Expected values come from the generator's ground truth (expected_spec.yaml,

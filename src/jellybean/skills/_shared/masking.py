@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Masking of personal data in row previews (``sample_rows``, exemplars).
 
 A column is masked when its *name* matches a configured pattern or when most of

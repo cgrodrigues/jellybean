@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Resource use of the profiler's integrity checks: scans, query width, large-table path.
 
 A recording connection shows *how* a check queries the data, which is what makes

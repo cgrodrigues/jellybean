@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Run context: the state every tool needs to know which run it belongs to.
 
 Tools never receive paths or seeds from the LLM for infrastructure concerns.

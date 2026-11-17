@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Generator tests: determinism, planted anomalies and planted problems."""
 
 from __future__ import annotations

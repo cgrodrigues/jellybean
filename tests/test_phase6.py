@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 6: report, evaluation, feedback, resume, partial reports and prompt caching.
 
 Builds on the phase-5 run (deterministic tools over the dummy data). Runs that

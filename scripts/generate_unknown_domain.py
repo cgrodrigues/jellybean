@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate the "unknown domain" dataset: industrial machine telemetry.
 
 Same as ``jellybean generate-data --type telemetry``; the generator lives in

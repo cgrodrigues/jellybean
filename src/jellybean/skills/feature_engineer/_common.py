@@ -1,3 +1,6 @@
+# Copyright 2026 Carlos Rodrigues
+# SPDX-License-Identifier: Apache-2.0
+
 """Helpers shared by the feature engineer's tool modules (``tools.py`` and ``models.py``)."""
 
 from __future__ import annotations
