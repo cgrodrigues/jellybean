@@ -371,7 +371,12 @@ def build_report(ctx: RunContext, run_result: dict[str, Any] | None = None) -> s
             checks = f.checks
             evidence = []
             if "stability" in checks:
-                evidence.append(f"stability {checks['stability']['stability']}")
+                value = checks["stability"].get("stability")
+                evidence.append(
+                    f"stability {value}"
+                    if value is not None
+                    else f"stability not measured ({checks['stability'].get('reason', 'unknown')})"
+                )
             if checks.get("ensemble", {}).get("applicable"):
                 evidence.append(f"mean votes {checks['ensemble']['mean_votes']}")
             if "artifact" in checks and checks["artifact"].get("low_support_share") is not None:

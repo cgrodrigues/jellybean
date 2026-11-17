@@ -76,6 +76,8 @@ detection:
 critic:
   min_stability: 0.6               # a finding below this stability cannot be "confirmed"
   stability_runs: 5                # repetitions with other seeds/subsamples
+  stability_budget_share: 0.6      # share of the tool timeout stability_check may use before returning what it has
+  stability_max_rows: 50000        # entities used to re-detect a finding (seeded sample plus its members)
   artifact_min_share: 0.5          # share of a finding explained by a source (file, nulls, cleaning op)
   artifact_min_lift: 5.0           # ... and its lift over the population, to suspect an artifact
 

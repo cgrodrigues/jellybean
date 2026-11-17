@@ -454,6 +454,9 @@ def _run_with_timeout(fn: Callable[..., Any], kwargs: dict[str, Any], timeout_s:
     return box["value"]
 
 
+run_with_timeout = _run_with_timeout  # for tools that give a part of their own work a deadline
+
+
 def _error_message(result: ToolResult) -> str | None:
     """Message of an error result (for the trace), ``None`` for a successful one."""
     if result.status != "error":

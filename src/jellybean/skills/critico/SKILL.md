@@ -15,6 +15,13 @@ explained by how the data was produced or prepared, and supported by enough data
 
 1. `get_finding` with the id from your task.
 2. `stability_check`: does the finding come back with other seeds and subsamples?
+   Call it **once**. It works inside a time budget and always answers:
+   - `runs_completed` below `runs_requested`: the stability was measured on the
+     repetitions that fitted in the time. Use it as it is.
+   - `stability: null` (with a `reason`, e.g. `timeout`), or the call itself
+     timed out: stability could **not be measured**. Do not call it again, with
+     the same or other arguments. Continue with the other checks; the verdict
+     can then only be `weak` or `unstable` (or `artifact`).
 3. `ensemble_agreement`: do the outlier methods agree on its members? (Not
    applicable to temporal findings.)
 4. `artifact_check`: is it explained by a source file, a shifted file, nulls, a
@@ -42,6 +49,9 @@ explained by how the data was produced or prepared, and supported by enough data
      (`ensemble_agreement.mean_votes` < 2) and no cluster or graph method among
      its methods; or tiny effect sizes.
    - `confirmed`: stable, not an artefact, and supported.
+   - Stability not measured: `weak` when the other checks pass, `unstable` when
+     they give reasons to doubt it. Say in the evidence that stability was not
+     measured and why. Every finding must end with a verdict.
    If `set_verdict` refuses a verdict, read the reason and choose accordingly.
 8. `finish` with status `done` and a summary: the verdict, the decisive
    numbers, and the novelty.

@@ -175,6 +175,10 @@ class DetectionConfig(_Section):
 class CriticConfig(_Section):
     min_stability: float = Field(0.6, ge=0, le=1)  # below this a finding cannot be "confirmed"
     stability_runs: int = Field(5, ge=2, le=20)
+    # Share of the tool timeout the stability check may use; it then returns what it has.
+    stability_budget_share: float = Field(0.6, gt=0, lt=1)
+    # Entities used to re-detect a finding (a seeded sample plus the finding's members).
+    stability_max_rows: int = Field(50_000, ge=1000)
     artifact_min_share: float = Field(0.5, gt=0, le=1)  # share of the finding explained by a source
     artifact_min_lift: float = Field(5.0, ge=1)  # lift of that share over the population
 
