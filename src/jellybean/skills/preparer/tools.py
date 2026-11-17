@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, Val
 
 from jellybean.runtime.context import current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import (
     FILE_COLUMN,
     Source,
@@ -406,12 +406,16 @@ def _run_transform(
         name = prefix_name or source.name
         params = {"operations": [o.model_dump() for o in ops], "log": log, **(extra_params or {})}
         record = store.save_table_from_sql(
-            con, f"SELECT * FROM {final}", f"clean_{name}", parents=[source.name], params=params
+            con, f"SELECT * FROM {final}", f"clean_{prefix_part(name)}", parents=[source.name], params=params
         )
         log_id = None
         if has_keys:
             log_id = store.save_table_from_sql(
-                con, "SELECT * FROM __log", f"transform_log_{name}", parents=[record.id], params={"log": log}
+                con,
+                "SELECT * FROM __log",
+                f"transform_log_{prefix_part(name)}",
+                parents=[record.id],
+                params={"log": log},
             ).id
     finally:
         con.close()

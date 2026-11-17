@@ -30,7 +30,7 @@ from jellybean.runtime.tool_registry import current_tool, to_jsonable
 ArtifactType = Literal["table", "json", "plot", "text"]
 
 # Artifact ids double as DuckDB view names, so they must be plain identifiers.
-_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]{0,60}$")
+_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]{0,150}$")
 _ID_RE = re.compile(r"^([a-z][a-z0-9_]{0,60})_v(\d+)$")
 
 _EXTENSIONS: dict[str, str] = {"table": "parquet", "json": "json", "plot": "png", "text": "md"}
@@ -59,6 +59,18 @@ class ArtifactRecord(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     row_count: int | None = None
     created_at: str
+
+
+def prefix_part(name: str) -> str:
+    """Turn a column, dataset, method or user-supplied name into a valid piece of an artifact prefix.
+
+    Lower case; every run of characters outside ``[a-z0-9_]`` becomes one ``_``;
+    trimmed to 40 characters. Names that differ only by case or punctuation give
+    the same piece: their artifacts then differ by version (``_v1``, ``_v2``), and
+    the original name must be kept in the artifact's params.
+    """
+    part = re.sub(r"_+", "_", re.sub(r"[^a-z0-9_]+", "_", str(name).lower())).strip("_")
+    return part[:40].rstrip("_") or "x"
 
 
 def slugify(text: str) -> str:

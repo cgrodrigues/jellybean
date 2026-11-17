@@ -27,7 +27,7 @@ from pydantic import Field
 
 from jellybean.runtime.context import maybe_current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import (
     Source,
     SourceNotFoundError,
@@ -328,7 +328,7 @@ def profile_table(dataset: str, seed: int | None = None) -> ToolResult:
     finally:
         con.close()
 
-    record = _store().save_json(f"profile_{source.name}", full, parents=parents, params={"seed": seed})
+    record = _store().save_json(f"profile_{prefix_part(source.name)}", full, parents=parents, params={"seed": seed})
     compact_issues = [
         {
             "column": i["column"],
@@ -369,7 +369,7 @@ def infer_semantic_types(dataset: str, seed: int | None = None) -> ToolResult:
     }
     time_candidates = [n for n, g in guesses.items() if g.semantic_type == "timestamp"]
     record = _store().save_json(
-        f"semantic_types_{source.name}", {"dataset": source.name, "columns": result}, parents=[source.name]
+        f"semantic_types_{prefix_part(source.name)}", {"dataset": source.name, "columns": result}, parents=[source.name]
     )
     compact = {n: [g.semantic_type, g.confidence] for n, g in guesses.items()}
     return ToolResult.ok(
@@ -469,7 +469,7 @@ def infer_grain(dataset: str) -> ToolResult:
         ]
     )
     record = _store().save_json(
-        f"grain_{source.name}",
+        f"grain_{prefix_part(source.name)}",
         {
             "dataset": source.name,
             "rows": rows,
@@ -573,7 +573,9 @@ def suggest_entities(dataset: str) -> ToolResult:
         return ToolResult.error(str(exc))
     candidates.sort(key=lambda c: -c["score"])
     record = _store().save_json(
-        f"entities_{source.name}", {"dataset": source.name, "candidates": candidates}, parents=[source.name]
+        f"entities_{prefix_part(source.name)}",
+        {"dataset": source.name, "candidates": candidates},
+        parents=[source.name],
     )
     best = candidates[0]["column"] if candidates else None
     return ToolResult.ok(
@@ -770,7 +772,7 @@ def check_temporal_coverage(dataset: str, time_column: str) -> ToolResult:
         "hour_profile_tv": {str(k): round(v, 4) for k, v in tvs.items()},
         "issues": issues,
     }
-    record = _store().save_json(f"temporal_{source.name}", full, parents=[source.name])
+    record = _store().save_json(f"temporal_{prefix_part(source.name)}", full, parents=[source.name])
     return ToolResult.ok(
         {
             "dataset": source.name,
@@ -941,7 +943,7 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
         ]
         margin = round(top["score"] - (others[0] if others else 0.0), 4)
     record = _store().save_json(
-        f"join_candidates_{lsrc.name}_{rsrc.name}",
+        f"join_candidates_{prefix_part(lsrc.name)}_{prefix_part(rsrc.name)}",
         {"left": lsrc.name, "right": rsrc.name, "candidates": candidates, "score_margin": margin},
         parents=[lsrc.name, rsrc.name],
     )
@@ -1185,7 +1187,7 @@ def test_join(
     }
     masker = _masker()
     record = _store().save_json(
-        f"join_test_{lsrc.name}_{rsrc.name}",
+        f"join_test_{prefix_part(lsrc.name)}_{prefix_part(rsrc.name)}",
         {
             "left": lsrc.name,
             "right": rsrc.name,
@@ -1394,7 +1396,7 @@ def correlation_summary(dataset: str) -> ToolResult:
         return ToolResult.error(str(exc))
     redundant = [p for p in numeric_pairs if abs(p["pearson"]) >= 0.9]
     record = _store().save_json(
-        f"correlations_{source.name}",
+        f"correlations_{prefix_part(source.name)}",
         {"dataset": source.name, "numeric_pairs": numeric_pairs, "dependencies": dependencies},
         parents=[source.name],
     )

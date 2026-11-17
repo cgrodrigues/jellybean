@@ -26,7 +26,7 @@ from pydantic import Field
 
 from jellybean.runtime.context import current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import SourceNotFoundError, connect, quote_ident, resolve_source
 from jellybean.skills._shared.column_stats import describe, type_family
 from jellybean.skills._shared.detection import (
@@ -61,6 +61,7 @@ OutlierMethod = Literal["isolation_forest", "lof", "ecod", "hbos", "autoencoder"
 ClusterMethod = Literal["hdbscan", "gmm", "kmeans"]
 GraphMethod = Literal["components", "communities", "centrality"]
 _MAX_SERIES_POINTS = 3_000_000
+_MIN_SERIES_BUCKETS = 8  # fewer time buckets than this cannot show what is usual
 
 
 def _store() -> ArtifactStore:
@@ -92,7 +93,7 @@ def _load_matrix(features: str, families: list[str] | None = None) -> tuple[pd.D
 
 def _save_run(kind: str, method: str, table: pd.DataFrame, parents: list[str], params: dict[str, Any]) -> str:
     record = _store().save_dataframe(
-        f"detection_{method}", table, parents=parents, params={"kind": kind, "method": method, **params}
+        f"detection_{prefix_part(method)}", table, parents=parents, params={"kind": kind, "method": method, **params}
     )
     return record.id
 
@@ -427,7 +428,7 @@ def run_timeseries_anomaly(
         for w in windows
     ]
     run_id = store.save_dataframe(
-        f"detection_ts_{measure}",
+        f"detection_ts_{prefix_part(measure)}",
         points_table,
         parents=[source.name],
         params={
@@ -455,8 +456,26 @@ def run_timeseries_anomaly(
         }
         for w in window_json[:5]
     ]
+    # An empty table of anomalous points is a result, not a failure: say which.
+    warnings = []
+    if n_buckets < _MIN_SERIES_BUCKETS:
+        warnings.append(
+            f"Only {n_buckets} {granularity} buckets: too few to tell what is usual, so nothing can stand out. "
+            + ("Use granularity 'hour'." if granularity == "day" else "The period is too short for this test.")
+        )
+    if len(points):
+        outcome = f"{len(points)} anomalous {granularity} buckets in {len(windows)} windows"
+    elif warnings:
+        outcome = "no anomalous buckets could be found: too few time buckets (see warnings)"
+    else:
+        outcome = (
+            f"no anomalous buckets: none of the {n_points} {granularity} buckets is {threshold:g} robust "
+            "deviations above its usual value. This is a valid result (the run has no rows)."
+        )
     return ToolResult.ok(
         {
+            "measure": measure,
+            "result": outcome,
             "series": int(series["group"].nunique()),
             "points": n_points,
             "anomalous_points": len(points),
@@ -465,6 +484,7 @@ def run_timeseries_anomaly(
             "top_windows": shown,
         },
         artifact_id=run_id,
+        warnings=warnings,
     )
 
 
