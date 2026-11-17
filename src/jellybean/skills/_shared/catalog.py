@@ -212,6 +212,16 @@ def resolve_source(name: str, ctx: RunContext | None = None, settings: Settings 
         return Source(name, "dataset", datasets[name])
     if ctx is not None and name in _table_artifacts(ctx):
         return Source(name, "artifact")
+    if ctx is not None:
+        from jellybean.skills._shared.artifacts import ArtifactStore
+
+        store = ArtifactStore(ctx)
+        if store.exists(name):
+            kind = store.get(name).type
+            how = "read it with read_json_artifact" if kind == "json" else "it cannot be queried"
+            raise SourceNotFoundError(
+                f"'{name}' is a {kind} artifact, not a table: {how} (get_artifact_info shows what it is)."
+            )
     available = sorted(datasets)
     raise SourceNotFoundError(f"Unknown dataset or table artifact '{name}'. Datasets: {available}")
 

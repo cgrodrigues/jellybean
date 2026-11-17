@@ -137,3 +137,59 @@ def test_cleaning_plan_does_not_recommend_removing_repeated_events(events_run: R
     dedupes = [o for o in ops if o["operation"]["op"] == "dedupe"]
     # Exact-row dedupe is offered, never recommended, and never keyed on anything.
     assert dedupes and all(o["requires_explicit_approval"] and not o["operation"].get("keys") for o in dedupes)
+
+
+# ------------------------------------------------- shapes and messages (Task 3)
+def test_update_spec_errors_say_what_was_sent_and_what_is_expected(events_run: Runtime) -> None:
+    wrong = ot.update_spec(patch={"grain": ["IMSI", "EVENT_START_DATE"], "columns": {"IMSI": "identifier"}})
+    assert wrong.status == "error"
+    text = wrong.summary["error"]
+    assert "pydantic.dev" not in text and "grain" in text and "columns.IMSI" in text
+    assert "['IMSI', 'EVENT_START_DATE']" in text  # what was sent
+    assert '"unique": false' in text  # the expected shape, with the no-key form
+    assert '{"dataset": "events", "semantic_type": "identifier"}' in text
+
+
+def test_every_documented_spec_example_is_valid(events_run: Runtime) -> None:
+    from jellybean.skills._shared.spec_tools import SPEC_FIELD_EXAMPLES
+    from jellybean.spec import apply_patch
+
+    ot.update_spec(
+        patch={
+            "datasets": [
+                {"name": "events", "path": "p", "role": "primary"},
+                {"name": "customers", "path": "p", "role": "enrichment"},
+            ]
+        }
+    )
+    spec = read_spec()
+    assert {"grain", "entity", "columns", "joins", "time_column"} <= set(SPEC_FIELD_EXAMPLES)
+    for field, examples in SPEC_FIELD_EXAMPLES.items():
+        for example in examples:
+            apply_patch(spec, {field: example})  # raises when an example drifts from the model
+    from jellybean.runtime.tool_registry import TOOL_SPEC_ATTR
+
+    description = getattr(ot.update_spec, TOOL_SPEC_ATTR).description
+    assert '"unique": false' in description and '"semantic_type"' in description  # shown to the agent
+
+
+def test_a_human_change_to_no_unique_key_is_one_update(events_run: Runtime) -> None:
+    _propose()
+    ot.update_spec(patch={"grain": {"columns": ["IMSI", "EVENT_START_DATE"], "unique": True}})
+    changed = ot.update_spec(patch={"grain": {"columns": [], "unique": False}})
+    assert changed.status == "ok" and read_spec().grain == GrainSpec(dataset="events", columns=[], unique=False)
+    assert ot.prepare_spec_confirmation().summary["ready"] is True
+
+
+def test_profiler_evidence_is_readable_and_json_artifacts_are_not_tables(events_run: Runtime) -> None:
+    from jellybean.skills._shared import data_tools
+
+    types = pt.infer_semantic_types("events")
+    read = data_tools.read_json_artifact(types.artifact_id)
+    assert read.status == "ok" and "IMSI" in str(read.summary)
+    assert "sample" not in str(read.summary).lower()  # the tool promises samples are never returned
+    profile = pt.profile_table("events")
+    assert data_tools.read_json_artifact(profile.artifact_id).status == "error"  # profiles hold sample values
+    schema = data_tools.get_schema(types.artifact_id)
+    assert schema.status == "error"
+    assert "read_json_artifact" in schema.summary["error"] and "Datasets:" not in schema.summary["error"]

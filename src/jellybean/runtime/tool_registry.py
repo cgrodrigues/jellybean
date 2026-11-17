@@ -343,13 +343,20 @@ class _ArgumentError(Exception):
     """Raised when call arguments do not match the tool signature."""
 
 
-def _format_validation_error(exc: ValidationError) -> str:
-    """Render pydantic errors in a short form the LLM can act on."""
+def _format_validation_error(exc: ValidationError, prefix: str = "Invalid arguments", show_input: bool = False) -> str:
+    """Render pydantic errors in a short form the LLM can act on (no URLs, one clause per field).
+
+    With ``show_input`` each clause also says what was sent (shortened).
+    """
     parts = []
     for err in exc.errors()[:10]:
         loc = ".".join(str(p) for p in err["loc"]) or "<root>"
-        parts.append(f"{loc}: {err['msg']}")
-    return "Invalid arguments: " + "; ".join(parts)
+        sent = ""
+        if show_input and "input" in err:
+            text = repr(err["input"])
+            sent = f" (sent: {text if len(text) <= 80 else text[:77] + '...'})"
+        parts.append(f"{loc}: {err['msg']}{sent}")
+    return f"{prefix}: " + "; ".join(parts)
 
 
 def _build_params_model(fn: Callable[..., Any], name: str, arg_docs: dict[str, str]) -> type[BaseModel]:

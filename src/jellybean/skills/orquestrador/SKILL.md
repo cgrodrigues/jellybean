@@ -50,7 +50,11 @@ only use the shared tools to find datasets and read their notes.
      - "Change something" -> ask the human (with `ask_human`) which item to
        change among the alternatives shown in the evidence, apply it with
        `update_spec` (e.g. another entity from `entity.alternatives`, or set a
-       join's `status` to `rejected`), then repeat Control 1.
+       join's `status` to `rejected`), then repeat Control 1. One call per
+       change, with the shapes listed in the description of `update_spec`: for
+       "the table has no unique key" send
+       `{"grain": {"columns": [], "unique": false}}`; for a key send
+       `{"grain": {"columns": ["a", "b"], "unique": true}}`.
      - "Stop the run" -> finish with status `needs_human`.
 5. **Cleaning plan.** Delegate to `preparer` with the task
    "propose: propose a cleaning plan from the quality issues in the spec."
