@@ -65,9 +65,28 @@ def list_datasets() -> ToolResult:
     Returns per dataset the number of files, number of rows, size on disk,
     Hive partition columns and whether a README.md with notes exists.
     """
-    datasets = discover_datasets(_settings().data_root)
+    root = _settings().data_root
+    datasets = discover_datasets(root)
+    # Folders with Parquet files whose name cannot be a table name are not datasets: say so.
+    skipped = (
+        sorted(
+            p.name
+            for p in root.iterdir()
+            if p.is_dir() and not p.name.startswith((".", "_")) and p.name not in datasets and any(p.rglob("*.parquet"))
+        )
+        if root.is_dir()
+        else []
+    )
+    unusable = (
+        [
+            f"Folders not usable as datasets (rename them: letters, digits and '_' only, starting with a letter): "
+            f"{skipped}"
+        ]
+        if skipped
+        else []
+    )
     if not datasets:
-        return ToolResult.ok({"datasets": []}, warnings=["No datasets found in the data root."])
+        return ToolResult.ok({"datasets": []}, warnings=["No datasets found in the data root.", *unusable])
     con = connect()
     try:
         items = []
@@ -85,7 +104,7 @@ def list_datasets() -> ToolResult:
             )
     finally:
         con.close()
-    return ToolResult.ok({"datasets": items})
+    return ToolResult.ok({"datasets": items}, warnings=unusable)
 
 
 @tool
@@ -278,10 +297,14 @@ def get_artifact_info(artifact_id: str) -> ToolResult:
 
 
 # JSON artifacts an agent may read in full: plans, issues, dictionaries and the
-# profiler's evidence (summaries with masked examples). Join tests (they list raw
-# duplicated key values) and profiles (sample values) stay summarised by the tools
-# that made them; table artifacts are queried with run_sql.
+# profiler's evidence (summaries with masked examples). Semantic types hold only the
+# type, confidence and reason of each column (never sample values), and correlations
+# only column names and coefficients. Join tests (they list raw duplicated key values)
+# and profiles (sample and top values) stay summarised by the tools that made them;
+# table artifacts are queried with run_sql.
 _READABLE_JSON_PREFIXES = (
+    "semantic_types",
+    "correlations",
     "cleaning_plan",
     "quality_issues",
     "feature_dictionary",
@@ -304,7 +327,7 @@ def read_json_artifact(artifact_id: str) -> ToolResult:
     """Read the content of a JSON artifact: a plan, quality issues, a feature dictionary or the profiler's evidence.
 
     Readable: cleaning plans, quality issues, feature dictionaries, join candidates,
-    grain, entities, temporal coverage and the integrity checks (nulls,
+    semantic types, correlations, grain, entities, temporal coverage and the integrity checks (nulls,
     invariants, references, reciprocity, duplicate keys, signs, self-references).
 
     Large content is shortened to fit the output limit.

@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, Val
 
 from jellybean.runtime.context import current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import (
     FILE_COLUMN,
     Source,
@@ -207,6 +207,19 @@ def _key_columns(columns: list[str]) -> list[str]:
     return keys
 
 
+def _non_unique_grain(dataset: str) -> set[str] | None:
+    """Grain columns of ``dataset`` (or of the dataset it was prepared from) when the grain is not unique."""
+    try:
+        spec = read_spec()
+    except SpecMissingError:
+        return None
+    grain = spec.grain
+    if grain is None or grain.unique or not grain.columns:
+        return None
+    names = {grain.dataset, spec.prepared.get(grain.dataset), spec.enriched_artifact}
+    return set(grain.columns) if dataset in names else None
+
+
 def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tuple[str, list[dict[str, Any]], bool]:
     """Apply ``ops`` as a chain of temp tables. Returns (final table, per-op log, has_key_log)."""
     needs_file = any(isinstance(o, FixUnitsOp) and o.file for o in ops)
@@ -222,6 +235,7 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         log_cols = ", ".join(f"{quote_ident(k)}" for k in keys)
         con.execute(f"CREATE OR REPLACE TEMP TABLE __log AS SELECT ''::VARCHAR AS op_id, {log_cols} FROM s0 LIMIT 0")
     log: list[dict[str, Any]] = []
+    non_unique_grain = _non_unique_grain(source.name)
 
     def need(col: str) -> str:
         if col not in schema:
@@ -235,6 +249,12 @@ def _apply(con: duckdb.DuckDBPyConnection, source: Source, ops: list[Any]) -> tu
         removed = False
         if isinstance(op, DedupeOp):
             removed = True
+            if op.keys and set(op.keys) == non_unique_grain:
+                raise ValueError(
+                    f"dedupe on {sorted(op.keys)} refused: these columns are the grain of the dataset and it is "
+                    "not unique (several rows per combination are legitimate events). Only exact duplicate rows "
+                    'may be removed: {"op": "dedupe"} without keys.'
+                )
             if op.keys:
                 part = ", ".join(need(k) for k in op.keys)
                 order_col = need(op.order_by) if op.order_by else None
@@ -386,12 +406,16 @@ def _run_transform(
         name = prefix_name or source.name
         params = {"operations": [o.model_dump() for o in ops], "log": log, **(extra_params or {})}
         record = store.save_table_from_sql(
-            con, f"SELECT * FROM {final}", f"clean_{name}", parents=[source.name], params=params
+            con, f"SELECT * FROM {final}", f"clean_{prefix_part(name)}", parents=[source.name], params=params
         )
         log_id = None
         if has_keys:
             log_id = store.save_table_from_sql(
-                con, "SELECT * FROM __log", f"transform_log_{name}", parents=[record.id], params={"log": log}
+                con,
+                "SELECT * FROM __log",
+                f"transform_log_{prefix_part(name)}",
+                parents=[record.id],
+                params={"log": log},
             ).id
     finally:
         con.close()
@@ -465,7 +489,7 @@ _OP_ORDER = {"fix_units": 0, "flip_sign": 0, "normalize": 1, "cast": 2, "drop_ro
 
 
 @tool
-def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = None) -> ToolResult:
+def propose_cleaning_plan(issues_artifact: str | None = None, skip_issues: list[str] | None = None) -> ToolResult:
     """Propose a justified cleaning plan, operation by operation, from the compiled quality issues.
 
     The plan is stored as an artifact and recorded in the spec (status "proposed").
@@ -474,17 +498,22 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
     shifts, unmatched rows, spikes) are listed with the reason.
 
     Args:
-        issues_artifact: Artifact id from compile_quality_issues.
+        issues_artifact: Artifact id from compile_quality_issues (default: the one recorded in the spec).
+            Without any quality issues the plan is empty: nothing to clean is a valid plan.
         skip_issues: Ids to leave out: issue ids ("Q003") or operation ids of a previous plan ("P02").
     """
     store = _store()
     try:
         spec = read_spec()
-        issues = store.load_json(issues_artifact)["issues"]
+        issues_artifact = issues_artifact or spec.evidence_artifacts.get("quality_issues")
+        issues = store.load_json(issues_artifact)["issues"] if issues_artifact else []
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
     except (ArtifactNotFoundError, FileNotFoundError, KeyError, TypeError):
-        return ToolResult.error(f"'{issues_artifact}' is not a quality-issues artifact.")
+        return ToolResult.error(
+            f"'{issues_artifact}' is not a quality-issues artifact. Pass the id in "
+            "spec.evidence_artifacts.quality_issues, or no id at all to use it (an empty plan when there is none)."
+        )
     skip = set(skip_issues or [])
     # Operation ids (P..) refer to the current plan: translate them into issue ids.
     if any(x.startswith("P") for x in skip) and spec.cleaning_plan.artifact_id:
@@ -527,8 +556,26 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
             )
             continue
         semantic = _semantic_type(spec, dataset, column) if column else None
-        if kind == "duplicate_rows":
+        no_key = spec.grain is not None and not spec.grain.unique and spec.grain.dataset == dataset
+        if kind == "duplicate_rows" and no_key:
+            # Without a key, identical rows can be distinct events: removing them is a person's decision.
+            add(
+                dataset,
+                {"op": "dedupe"},
+                issue,
+                f"{detail.get('rows')} exact duplicate rows. The table has no unique key, so identical rows may be "
+                "distinct events: remove them only if they are known to be repeated records.",
+                explicit=True,
+            )
+        elif kind == "duplicate_rows":
             add(dataset, {"op": "dedupe"}, issue, f"{detail.get('rows')} exact duplicate rows inflate counts.")
+        elif kind == "duplicate_keys" and no_key and set(column.split(",")) == set(spec.grain.columns):
+            not_addressed.append(
+                {
+                    "issue_id": issue["id"],
+                    "reason": "these columns are the non-unique grain: repeated combinations are legitimate events",
+                }
+            )
         elif kind == "duplicate_keys":
             order_by = _temporal_column(spec, dataset)
             keys = column.split(",")
@@ -662,7 +709,9 @@ def propose_cleaning_plan(issues_artifact: str, skip_issues: list[str] | None = 
             return ToolResult.error(f"Internal plan error: {exc}")
         plan_ops.append(PlanOp(id=f"P{n:02d}", **op).model_dump())
     record = store.save_json(
-        "cleaning_plan", {"ops": plan_ops, "not_addressed": not_addressed}, parents=[issues_artifact]
+        "cleaning_plan",
+        {"ops": plan_ops, "not_addressed": not_addressed},
+        parents=[issues_artifact] if issues_artifact else [],
     )
     # A re-proposal keeps `applied_signature`: what was applied stays in effect
     # until a different set of operations is approved and applied.
@@ -766,11 +815,26 @@ def materialize_join(join_index: int = 0, left_artifact: str | None = None) -> T
         spec = read_spec()
     except SpecMissingError as exc:
         return ToolResult.error(str(exc))
+    confirmed = [i for i, j in enumerate(spec.joins) if j.status == "confirmed"]
+    if not confirmed and all(j.status == "rejected" for j in spec.joins):
+        # A single dataset, or every join rejected: there is nothing to enrich with.
+        if spec.phase in ("discovery", "cleaning"):
+            patch_spec({"phase": "features"})
+        return ToolResult.ok(
+            {
+                "skipped": True,
+                "reason": "the spec has no confirmed join",
+                "next": "nothing to join: the feature engineer uses the cleaned primary dataset (spec.prepared) "
+                "or, without one, the raw primary dataset",
+            }
+        )
     if not 0 <= join_index < len(spec.joins):
-        return ToolResult.error(f"No join at index {join_index}.")
+        return ToolResult.error(f"No join at index {join_index}. Confirmed joins are at indexes {confirmed}.")
     join = spec.joins[join_index]
     if join.status != "confirmed":
-        return ToolResult.error(f"Join {join_index} is '{join.status}', not confirmed.")
+        return ToolResult.error(
+            f"Join {join_index} is '{join.status}', not confirmed: skip it. Confirmed joins are at indexes {confirmed}."
+        )
     norms = join.key_normalization or ["none"]
     norms = norms * len(join.keys) if len(norms) == 1 else norms
     if not all(is_valid_strategy(n) for n in norms):
@@ -832,7 +896,10 @@ def materialize_join(join_index: int = 0, left_artifact: str | None = None) -> T
     finally:
         con.close()
     if record.row_count != before:
-        return ToolResult.error(f"Join changed the row count ({before} -> {record.row_count}).")
+        return ToolResult.error(
+            f"Join changed the row count ({before} -> {record.row_count}): the right side is not unique on the key. "
+            "Do not use this result: finish with status needs_rework and this reason."
+        )
     patch_spec({"enriched_artifact": record.id, "phase": "features"})
     return ToolResult.ok(
         {

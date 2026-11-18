@@ -119,8 +119,32 @@ class InvariantSpec(_Model):
 
 
 class GrainSpec(_Model):
+    """What identifies a row of the primary dataset.
+
+    ``unique=True`` (default): ``columns`` is a key, one row per combination.
+    ``unique=False``: the table has no key (event-level rows; several rows per
+    entity and timestamp can be legitimate). ``columns`` is then empty, or the
+    closest combination found, which must never be used to remove duplicates.
+    """
+
     dataset: str
-    columns: list[str] = Field(min_length=1)
+    columns: list[str] = Field(default_factory=list)
+    unique: bool = True
+
+    @model_validator(mode="after")
+    def _key_has_columns(self) -> GrainSpec:
+        if self.unique and not self.columns:
+            raise ValueError(
+                "a unique grain needs at least one column; for a table with no unique key send "
+                '{"dataset": ..., "columns": [], "unique": false}'
+            )
+        return self
+
+    def label(self) -> str:
+        """Text shown to people: the key columns, or "no unique key"."""
+        if self.unique:
+            return ", ".join(self.columns)
+        return "no unique key" + (f" (closest: {', '.join(self.columns)})" if self.columns else "")
 
 
 class EntitySpec(_Model):

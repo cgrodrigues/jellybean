@@ -23,6 +23,17 @@ All notable changes to this project are recorded here. The format follows
 - `docs/performance-audit.md`: memory and CPU review of the whole pipeline.
 - `pytz`, so that DuckDB can return `TIMESTAMP WITH TIME ZONE` values.
 
+- A table with no unique key is a valid grain (`grain.unique: false`), shown as
+  "no unique key" at the spec confirmation and never used to remove duplicates.
+- `build_entity_features` has an `hour` window: counts per category level and
+  their maximum and mean per clock hour and per day.
+- Model fits run in a worker process killed at the tool timeout; a timed-out
+  call leaves no artifact and is not repeated; `limits.tool_timeouts`.
+- `stability_check` works inside a time budget and always records an answer;
+  `set_verdict` accepts `weak` or `unstable` when a check could not be measured.
+- An agent blocked by a repeating error is stopped and reports the blocker.
+- `docs/dead-end-audit.md` and `docs/spec-reference.md`.
+
 ### Changed
 
 - The profiler's integrity checks, statistics and join tests scan the data a
@@ -34,6 +45,9 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- `run_timeseries_anomaly` failed on upper-case measure names (artifact
+  prefixes built from column names).
+- `build_entity_features` dropped every grain column from the features.
 - `check_temporal_coverage` failed on data covering a single day.
 - `discover_arithmetic_invariants` timed out and exhausted memory on large tables.
 - Join-test artifacts (raw key values) are no longer readable through

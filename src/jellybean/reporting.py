@@ -263,7 +263,7 @@ def build_report(ctx: RunContext, run_result: dict[str, Any] | None = None) -> s
                 f"{j.cardinality} | {_fmt(j.coverage)} | {_fmt(j.fanout)} | {_fmt(j.confidence)} | {j.status} |"
             )
     if spec.grain:
-        add(f"\n**{t['grain']}:** `{spec.grain.dataset}` → {', '.join(spec.grain.columns)}")
+        add(f"\n**{t['grain']}:** `{spec.grain.dataset}` → {spec.grain.label()}")
     if spec.entity:
         alts = ", ".join(spec.entity.alternatives) or "-"
         add(f"\n**{t['entity']}:** `{spec.entity.column}` ({t['alternatives']}: {alts})")
@@ -371,7 +371,12 @@ def build_report(ctx: RunContext, run_result: dict[str, Any] | None = None) -> s
             checks = f.checks
             evidence = []
             if "stability" in checks:
-                evidence.append(f"stability {checks['stability']['stability']}")
+                value = checks["stability"].get("stability")
+                evidence.append(
+                    f"stability {value}"
+                    if value is not None
+                    else f"stability not measured ({checks['stability'].get('reason', 'unknown')})"
+                )
             if checks.get("ensemble", {}).get("applicable"):
                 evidence.append(f"mean votes {checks['ensemble']['mean_votes']}")
             if "artifact" in checks and checks["artifact"].get("low_support_share") is not None:

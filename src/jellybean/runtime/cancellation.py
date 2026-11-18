@@ -13,7 +13,12 @@ owns a :class:`CallScope`:
 * :meth:`CallScope.cancel` interrupts the running queries of the call and of the
   calls nested in it (a delegated agent's tools), and marks the scope so that any
   connection opened afterwards fails at once with :class:`ToolCancelledError`;
-* long pure-Python loops can call :func:`check_cancelled` between steps.
+* long pure-Python loops can call :func:`check_cancelled` between steps;
+* model fits, which cannot be interrupted, run in a worker process registered
+  with :meth:`CallScope.register_process` and killed on cancel
+  (``runtime/isolated.py``);
+* nothing a cancelled call does is kept: artifact, spec and finding writes call
+  :func:`check_cancelled` first.
 
 The scope travels in a context variable, copied into the worker thread of the call.
 """
@@ -38,6 +43,7 @@ class CallScope:
         self.cancelled = False
         self._lock = threading.Lock()
         self._connections: list[Any] = []
+        self._processes: list[Any] = []
         self._children: list[CallScope] = []
         if parent is not None:
             parent._adopt(self)
@@ -64,6 +70,17 @@ class CallScope:
                 raise ToolCancelledError("The tool call was cancelled: no new query is started.")
             self._connections.append(con)
 
+    def register_process(self, process: Any) -> None:
+        """Register a worker process of the call (see ``runtime/isolated.py``); it is killed on cancel."""
+        with self._lock:
+            cancelled = self.cancelled
+            if not cancelled:
+                self._processes.append(process)
+        if cancelled:
+            with contextlib.suppress(Exception):
+                process.kill()
+            raise ToolCancelledError("The tool call was cancelled: no new work is started.")
+
     def connections(self) -> list[Any]:
         with self._lock:
             return list(self._connections)
@@ -78,11 +95,15 @@ class CallScope:
 
     # ---------------------------------------------------------------- cancel
     def cancel(self) -> None:
-        """Mark the scope cancelled and interrupt every running query under it."""
+        """Mark the scope cancelled, interrupt every running query under it and kill its worker processes."""
         with self._lock:
             self.cancelled = True
             children = list(self._children)
+            processes, self._processes = self._processes, []
         self.interrupt()
+        for process in processes:
+            with contextlib.suppress(Exception):
+                process.kill()
         for child in children:
             child.cancel()
 

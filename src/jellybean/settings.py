@@ -70,11 +70,18 @@ class LimitsConfig(_Section):
     token_budget_per_run: int = Field(4_000_000, ge=1)
     tool_timeout_s: float = Field(300, gt=0)
     max_rework_cycles: int = Field(2, ge=0)
+    # An agent whose tool calls fail this many times in a row is stopped (it is blocked).
+    max_consecutive_tool_errors: int = Field(6, ge=2)
     # DuckDB resources, per connection (a tool normally opens one). Above the memory
     # limit DuckDB spills to `<run>/tmp` instead of exhausting the machine.
     duckdb_memory_limit: str | None = "4GB"  # null = DuckDB default (80% of RAM)
     duckdb_threads: int | None = Field(4, ge=1)  # null = DuckDB default (all cores)
     duckdb_max_temp_size: str | None = "50GB"  # cap on spilled data; null = DuckDB default
+    # Timeout of single tools, in seconds, overriding tool_timeout_s: {"run_clustering": 900}.
+    tool_timeouts: dict[str, float] = Field(default_factory=dict)
+    # Model fits (outlier methods, clustering, dimensionality reduction) on more rows than
+    # this run in a worker process that is killed at the timeout; null = always in-process.
+    isolate_above_rows: int | None = Field(20_000, ge=0)
 
 
 class ProfilingConfig(_Section):
@@ -90,6 +97,16 @@ class ProfilingConfig(_Section):
     sample_rows: int = Field(200_000, ge=100)
     # Candidate relations tested per statement (two filtered aggregates each).
     candidate_batch: int = Field(60, ge=1, le=500)
+
+
+class FeaturesConfig(_Section):
+    """Size caps of the feature engineer."""
+
+    # Rows of the intermediate (entity, hour) or (entity, day) table of the per-level
+    # window features; above it the window is skipped with a warning.
+    window_max_rows: int = Field(200_000_000, ge=1000)
+    # Category levels expanded into window features, over all columns.
+    window_max_levels: int = Field(60, ge=1)
 
 
 class ToolOutputConfig(_Section):
@@ -140,7 +157,10 @@ class DetectionConfig(_Section):
     merge_overlap: float = Field(0.8, gt=0, le=1)  # merge when this share of the smaller group is shared
     ts_threshold: float = Field(6.0, gt=0)  # robust z for time-series anomalies
     # Size caps of the steps whose cost grows faster than the number of entities.
-    cluster_max_rows: int = Field(200_000, ge=1000)  # HDBSCAN is fitted on a seeded sample above this
+    # HDBSCAN is fitted on a seeded sample above this. Its time grows with the square of the
+    # rows (16 s at 50k, 73 s at 100k, 322 s at 200k on 10 dimensions): 75k keeps it well
+    # inside the default tool timeout.
+    cluster_max_rows: int = Field(75_000, ge=1000)
     group_max_pool: int = Field(10_000, ge=100)  # pooled outliers grouped by pairwise distance (n^2 memory)
     plot_max_points: int = Field(50_000, ge=1000)  # population points drawn in a scatter plot
     # Above this many entities: outlier models are fitted on a seeded sample and score
@@ -157,6 +177,10 @@ class DetectionConfig(_Section):
 class CriticConfig(_Section):
     min_stability: float = Field(0.6, ge=0, le=1)  # below this a finding cannot be "confirmed"
     stability_runs: int = Field(5, ge=2, le=20)
+    # Share of the tool timeout the stability check may use; it then returns what it has.
+    stability_budget_share: float = Field(0.6, gt=0, lt=1)
+    # Entities used to re-detect a finding (a seeded sample plus the finding's members).
+    stability_max_rows: int = Field(50_000, ge=1000)
     artifact_min_share: float = Field(0.5, gt=0, le=1)  # share of the finding explained by a source
     artifact_min_lift: float = Field(5.0, ge=1)  # lift of that share over the population
 
@@ -200,6 +224,7 @@ class AppConfig(_Section):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
     profiling: ProfilingConfig = Field(default_factory=ProfilingConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     join_confidence: JoinConfidenceConfig = Field(default_factory=JoinConfidenceConfig)
     pattern_registry: PatternRegistryConfig = Field(default_factory=PatternRegistryConfig)

@@ -197,6 +197,8 @@ class AgentRunner:
         self.max_iterations = skill.max_iterations or limits.max_iterations_per_agent
         self.tools = runtime.registry.tools_for(skill.name)
         self.tools[FINISH_TOOL] = FINISH_SPEC
+        # Calls (tool + arguments) that timed out in this agent run: never executed again.
+        self._timed_out: set[tuple[str, str]] = set()
 
     def _system_prompt(self) -> str:
         return self.skill.system_prompt.rstrip() + RUNTIME_RULES
@@ -221,7 +223,19 @@ class AgentRunner:
             return self._rejected(name, {}, f"Unknown tool '{name}'. Available: {sorted(self.tools)}")
         if not isinstance(arguments, dict):
             return self._rejected(name, {}, "Tool arguments must be a JSON object.")
-        return spec.func(**arguments)
+        key = (name, json.dumps(arguments, sort_keys=True, default=str))
+        if key in self._timed_out:
+            return self._rejected(
+                name,
+                arguments,
+                f"Not run: this exact call to '{name}' already timed out in this task and would time out again. "
+                "Change the arguments (a smaller sample or fewer rows through the tool's parameters, fewer "
+                "columns, another method), or continue without it and report it as not run.",
+            )
+        result = spec.func(**arguments)
+        if result.status == "error" and result.summary.get("timed_out"):
+            self._timed_out.add(key)
+        return result
 
     @staticmethod
     def _rejected(name: str, arguments: dict[str, Any], message: str) -> ToolResult:
@@ -267,6 +281,11 @@ class AgentRunner:
         specs = list(self.tools.values())
         tokens_in = tokens_out = 0
         nudged = False
+        # Blocked-agent guard: the same error from the same tool twice in a row, or too many
+        # errors in a row, means the agent has no way forward. It stops and says why.
+        last_error: tuple[str, str] | None = None
+        error_streak = 0
+        max_errors = self.runtime.ctx.settings.config.limits.max_consecutive_tool_errors
         trace_event(
             "agent_start", task_chars=len(task), task=task[:160], artifact_ids=artifact_ids, tools=sorted(self.tools)
         )
@@ -325,14 +344,38 @@ class AgentRunner:
 
             finish_args: dict[str, Any] | None = None
             finish_index = -1
+            blocker: tuple[str, str] | None = None
             for call in response.tool_calls:
                 if call.name == FINISH_TOOL:
                     finish_args = call.arguments if isinstance(call.arguments, dict) else {}
                     finish_index = len(messages)
                     content = json.dumps({"status": "ok", "summary": {"accepted": True}})
                 else:
-                    content = self._execute(call.name, call.arguments).to_json()
+                    outcome = self._execute(call.name, call.arguments)
+                    content = outcome.to_json()
+                    if outcome.status == "error":
+                        message = str(outcome.summary.get("error", ""))
+                        error_streak += 1
+                        if last_error == (call.name, message):
+                            blocker = (f"blocked:{call.name}", f"'{call.name}' failed twice in a row with: {message}")
+                        elif error_streak >= max_errors:
+                            blocker = (
+                                "blocked:consecutive_errors",
+                                f"{error_streak} tool calls in a row failed; the last one, '{call.name}': {message}",
+                            )
+                        last_error = (call.name, message)
+                    else:
+                        last_error, error_streak = None, 0
                 messages.append(Message(role="tool", content=content, tool_call_id=call.id, name=call.name))
+
+            if blocker is not None and finish_args is None:
+                return self._result(
+                    "failed",
+                    f"Stopped: the agent was blocked. {blocker[1]}"[:1500],
+                    iteration,
+                    (tokens_in, tokens_out),
+                    issues=[blocker[0]],
+                )
 
             if finish_args is not None:
                 try:

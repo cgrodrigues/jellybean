@@ -27,7 +27,7 @@ from pydantic import Field
 
 from jellybean.runtime.context import maybe_current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import (
     Source,
     SourceNotFoundError,
@@ -328,7 +328,7 @@ def profile_table(dataset: str, seed: int | None = None) -> ToolResult:
     finally:
         con.close()
 
-    record = _store().save_json(f"profile_{source.name}", full, parents=parents, params={"seed": seed})
+    record = _store().save_json(f"profile_{prefix_part(source.name)}", full, parents=parents, params={"seed": seed})
     compact_issues = [
         {
             "column": i["column"],
@@ -369,7 +369,7 @@ def infer_semantic_types(dataset: str, seed: int | None = None) -> ToolResult:
     }
     time_candidates = [n for n, g in guesses.items() if g.semantic_type == "timestamp"]
     record = _store().save_json(
-        f"semantic_types_{source.name}", {"dataset": source.name, "columns": result}, parents=[source.name]
+        f"semantic_types_{prefix_part(source.name)}", {"dataset": source.name, "columns": result}, parents=[source.name]
     )
     compact = {n: [g.semantic_type, g.confidence] for n, g in guesses.items()}
     return ToolResult.ok(
@@ -387,6 +387,8 @@ def infer_grain(dataset: str) -> ToolResult:
 
     Reports single columns that are unique, unique once exact duplicate rows are
     removed, or nearly unique; tries column pairs only when no single column works.
+    `unique_key: false` means the table has no key (an event-level table): that
+    is a valid result, recorded by propose_spec as "no unique key".
 
     Args:
         dataset: Dataset name or table artifact id.
@@ -456,13 +458,23 @@ def infer_grain(dataset: str) -> ToolResult:
                 source.name, None, "duplicate_rows", _severity((rows - distinct_rows) / rows), rows=rows - distinct_rows
             )
         )
-    warnings = [] if candidates else ["No unique column or pair found; the grain may need more columns."]
+    unique_key = bool(candidates)
+    warnings = (
+        []
+        if unique_key
+        else [
+            "No unique key: no column or pair of columns identifies a row. This is a valid result for an "
+            "event-level table (several rows per entity and timestamp can be legitimate). Pass this artifact to "
+            "propose_spec as it is; do not look for a key by adding columns."
+        ]
+    )
     record = _store().save_json(
-        f"grain_{source.name}",
+        f"grain_{prefix_part(source.name)}",
         {
             "dataset": source.name,
             "rows": rows,
             "distinct_rows": distinct_rows,
+            "unique_key": unique_key,
             "candidates": candidates,
             "issues": issues,
         },
@@ -473,6 +485,7 @@ def infer_grain(dataset: str) -> ToolResult:
             "dataset": source.name,
             "rows": rows,
             "exact_duplicate_rows": rows - distinct_rows,
+            "unique_key": unique_key,
             "candidates": candidates[:8],
             "recommended": candidates[0]["columns"] if candidates else None,
         },
@@ -560,7 +573,9 @@ def suggest_entities(dataset: str) -> ToolResult:
         return ToolResult.error(str(exc))
     candidates.sort(key=lambda c: -c["score"])
     record = _store().save_json(
-        f"entities_{source.name}", {"dataset": source.name, "candidates": candidates}, parents=[source.name]
+        f"entities_{prefix_part(source.name)}",
+        {"dataset": source.name, "candidates": candidates},
+        parents=[source.name],
     )
     best = candidates[0]["column"] if candidates else None
     return ToolResult.ok(
@@ -757,7 +772,7 @@ def check_temporal_coverage(dataset: str, time_column: str) -> ToolResult:
         "hour_profile_tv": {str(k): round(v, 4) for k, v in tvs.items()},
         "issues": issues,
     }
-    record = _store().save_json(f"temporal_{source.name}", full, parents=[source.name])
+    record = _store().save_json(f"temporal_{prefix_part(source.name)}", full, parents=[source.name])
     return ToolResult.ok(
         {
             "dataset": source.name,
@@ -928,7 +943,7 @@ def discover_join_candidates(left: str, right: str, seed: int | None = None) -> 
         ]
         margin = round(top["score"] - (others[0] if others else 0.0), 4)
     record = _store().save_json(
-        f"join_candidates_{lsrc.name}_{rsrc.name}",
+        f"join_candidates_{prefix_part(lsrc.name)}_{prefix_part(rsrc.name)}",
         {"left": lsrc.name, "right": rsrc.name, "candidates": candidates, "score_margin": margin},
         parents=[lsrc.name, rsrc.name],
     )
@@ -1172,7 +1187,7 @@ def test_join(
     }
     masker = _masker()
     record = _store().save_json(
-        f"join_test_{lsrc.name}_{rsrc.name}",
+        f"join_test_{prefix_part(lsrc.name)}_{prefix_part(rsrc.name)}",
         {
             "left": lsrc.name,
             "right": rsrc.name,
@@ -1381,7 +1396,7 @@ def correlation_summary(dataset: str) -> ToolResult:
         return ToolResult.error(str(exc))
     redundant = [p for p in numeric_pairs if abs(p["pearson"]) >= 0.9]
     record = _store().save_json(
-        f"correlations_{source.name}",
+        f"correlations_{prefix_part(source.name)}",
         {"dataset": source.name, "numeric_pairs": numeric_pairs, "dependencies": dependencies},
         parents=[source.name],
     )
@@ -1535,12 +1550,20 @@ def propose_spec(
                     "evidence_artifact": artifact_id,
                 }
             )
-        grain_doc = _load_kind(store, grain, "candidates")
-        if not grain_doc["candidates"]:
-            return ToolResult.error(f"Grain artifact '{grain}' has no candidates.")
+        grain_doc = store.load_json(grain)
+        if not isinstance(grain_doc, dict) or not {"candidates", "distinct_rows"} <= set(grain_doc):
+            return ToolResult.error(
+                f"'{grain}' is not a grain artifact: pass the artifact id returned by infer_grain on the primary "
+                "dataset (also when it found no unique key)."
+            )
+        # No candidate: the table has no key. That is recorded, not refused.
+        grain_patch = (
+            {"dataset": grain_doc["dataset"], "columns": grain_doc["candidates"][0]["columns"], "unique": True}
+            if grain_doc["candidates"]
+            else {"dataset": grain_doc["dataset"], "columns": [], "unique": False}
+        )
         ent_doc = _load_kind(store, entities, "candidates")
-        if not ent_doc["candidates"]:
-            return ToolResult.error(f"Entities artifact '{entities}' has no candidates.")
+        no_entity = not ent_doc["candidates"]
         columns: dict[str, dict[str, str]] = {}
         typed = [(_load_kind(store, a, "columns"), a) for a in semantic_types]
         all_names = [name for doc, _ in typed for name in doc["columns"]]
@@ -1551,16 +1574,20 @@ def propose_spec(
         evidence = {"grain": grain, "entity": entities, **{f"semantic_types:{doc['dataset']}": a for doc, a in typed}}
         patch: dict[str, Any] = {
             "joins": joins,
-            "grain": {"dataset": grain_doc["dataset"], "columns": grain_doc["candidates"][0]["columns"]},
-            "entity": {
+            "grain": grain_patch,
+            "entity": None
+            if no_entity
+            else {
                 "column": ent_doc["candidates"][0]["column"],
                 "alternatives": [c["column"] for c in ent_doc["candidates"][1:4]],
             },
             "columns": columns,
             "evidence_artifacts": evidence,
         }
-        if spec.entity is not None and spec.entity.source == "user":
-            patch.pop("entity")  # fixed by the user with --entity: never overwritten
+        if no_entity or (spec.entity is not None and spec.entity.source == "user"):
+            # Fixed by the user with --entity (never overwritten), or no candidate found: the
+            # rest of the proposal is still written and the entity is asked at control 1.
+            patch.pop("entity")
         if temporal:
             patch["time_column"] = _load_kind(store, temporal, "time_column")["time_column"]
             evidence["temporal"] = temporal
@@ -1629,4 +1656,9 @@ def propose_spec(
     except ValueError as exc:
         return ToolResult.error(f"Proposal rejected: {exc}"[:1500])
     warnings = [f"Not recorded in the spec (their issues are in the quality issues): {ignored}"] if ignored else []
+    if no_entity and new_spec.entity is None:
+        warnings.append(
+            "No entity candidate was found, so the spec has no entity: the rest of the proposal was written. "
+            "Say so in your summary; the orchestrator will ask the user for it. Do not invent one."
+        )
     return ToolResult.ok({"proposed": sorted(patch), "spec": new_spec.compact_summary()}, warnings=warnings)

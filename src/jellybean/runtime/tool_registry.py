@@ -343,13 +343,20 @@ class _ArgumentError(Exception):
     """Raised when call arguments do not match the tool signature."""
 
 
-def _format_validation_error(exc: ValidationError) -> str:
-    """Render pydantic errors in a short form the LLM can act on."""
+def _format_validation_error(exc: ValidationError, prefix: str = "Invalid arguments", show_input: bool = False) -> str:
+    """Render pydantic errors in a short form the LLM can act on (no URLs, one clause per field).
+
+    With ``show_input`` each clause also says what was sent (shortened).
+    """
     parts = []
     for err in exc.errors()[:10]:
         loc = ".".join(str(p) for p in err["loc"]) or "<root>"
-        parts.append(f"{loc}: {err['msg']}")
-    return "Invalid arguments: " + "; ".join(parts)
+        sent = ""
+        if show_input and "input" in err:
+            text = repr(err["input"])
+            sent = f" (sent: {text if len(text) <= 80 else text[:77] + '...'})"
+        parts.append(f"{loc}: {err['msg']}{sent}")
+    return f"{prefix}: " + "; ".join(parts)
 
 
 def _build_params_model(fn: Callable[..., Any], name: str, arg_docs: dict[str, str]) -> type[BaseModel]:
@@ -447,6 +454,9 @@ def _run_with_timeout(fn: Callable[..., Any], kwargs: dict[str, Any], timeout_s:
     return box["value"]
 
 
+run_with_timeout = _run_with_timeout  # for tools that give a part of their own work a deadline
+
+
 def _error_message(result: ToolResult) -> str | None:
     """Message of an error result (for the trace), ``None`` for a successful one."""
     if result.status != "error":
@@ -486,7 +496,8 @@ def tool(
             settings = active_run.settings if active_run else get_settings()
             limit_chars = max_output_chars or settings.config.tool_output.max_output_chars
             limit_rows = settings.config.tool_output.max_raw_rows
-            limit_time = timeout_s or settings.config.limits.tool_timeout_s
+            limits = settings.config.limits
+            limit_time = limits.tool_timeouts.get(tool_name) or timeout_s or limits.tool_timeout_s
             started = time.perf_counter()
             call_args: dict[str, Any] = dict(kwargs)
 
@@ -519,9 +530,12 @@ def tool(
             except ValidationError as exc:
                 result = ToolResult.error(_format_validation_error(exc))
             except TimeoutError:
+                # Nothing the call wrote is kept (see ArtifactStore.create): it left no artifact.
                 result = ToolResult.error(
-                    f"Tool '{tool_name}' timed out after {limit_time:g}s and was stopped. "
-                    "Do not repeat the same call: narrow it (fewer columns, a filter, a sample)."
+                    f"Tool '{tool_name}' timed out after {limit_time:g}s and was stopped; it produced nothing. "
+                    "Do not repeat the same call: narrow it (fewer columns, a filter, a smaller sample, "
+                    "another method).",
+                    timed_out=True,
                 )
             except Exception as exc:
                 # Unexpected: the message goes to the agent, the trace and the console;

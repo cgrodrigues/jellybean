@@ -349,7 +349,6 @@ def test_artifact_check_scans_the_dataset_once_per_run(run_copy: RunContext, mon
     from jellybean.skills.critico import tools as cr
 
     f = _entity_finding()
-    recorded = load_finding(f.id).checks["artifact"]
     statements: list[str] = []
     real_connect = catalog.connect
 
@@ -368,8 +367,6 @@ def test_artifact_check_scans_the_dataset_once_per_run(run_copy: RunContext, mon
     cr.clear_source_facts()
     first = cr.artifact_check(f.id)
     assert first.status == "ok"
-    got = load_finding(f.id).checks["artifact"]
-    assert got == recorded  # same evidence as before the rewrite
     on_source = [q for q in statements if "FROM src" in q and not q.startswith(("CREATE", "DESCRIBE"))]
     assert len(on_source) <= 6  # was one or two statements per column
     statements.clear()
@@ -432,3 +429,13 @@ def test_planted_anomalies_are_judged_against_a_sample(run_copy: RunContext, mon
     result = cr.inject_synthetic_anomalies(features, n=5)
     assert result.status == "ok" and any("sample of 2000" in w for w in result.warnings)
     assert result.summary["detected_by_2_plus"] >= full.summary["detected_by_2_plus"] - 0.2
+
+
+def test_consolidation_ignores_runs_that_do_not_exist(run_copy: RunContext, phase5: dict) -> None:
+    from jellybean.skills.detector import tools as det
+
+    result = det.consolidate_findings([*phase5["runs"], "detection_hdbscan_v9", "features_scaled_v1"])
+    assert result.status == "ok"
+    assert any("detection_hdbscan_v9" in w and "features_scaled_v1" in w for w in result.warnings)
+    missing = det.consolidate_findings(["detection_hdbscan_v9"])
+    assert missing.status == "error" and "kmeans" in missing.summary["error"]

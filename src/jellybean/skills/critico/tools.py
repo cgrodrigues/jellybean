@@ -17,6 +17,8 @@ check is deterministic and records its result in the finding (``checks``), and
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Annotated, Any, Literal
 
 import numpy as np
@@ -24,7 +26,7 @@ import pandas as pd
 from pydantic import Field
 
 from jellybean.runtime.context import current_run
-from jellybean.runtime.tool_registry import ToolResult, tool
+from jellybean.runtime.tool_registry import ToolResult, run_with_timeout, tool
 from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
 from jellybean.skills._shared.catalog import (
     FILE_COLUMN,
@@ -260,14 +262,37 @@ def stability_check(
         f = _load(finding)
     except FindingNotFoundError as exc:
         return ToolResult.error(str(exc))
-    n_runs = n_runs or _config().critic.stability_runs
+    cfg = _config()
+    n_runs = n_runs or cfg.critic.stability_runs
+    requested = n_runs
     rng = np.random.default_rng(seed)
     recalls, jaccards = [], []
+    # The check must always leave an answer. It works inside a time budget below the tool
+    # limit and keeps what it measured; and it is recorded as attempted before any work,
+    # so that even a check killed at the tool limit does not block the verdict.
+    limit = cfg.limits.tool_timeouts.get("stability_check") or cfg.limits.tool_timeout_s
+    budget = cfg.critic.stability_budget_share * limit
+    started = time.monotonic()
+    attempt: dict[str, Any] = {
+        "stability": None,
+        "reason": "timeout",
+        "runs_completed": 0,
+        "runs_requested": requested,
+        "subsample": subsample,
+    }
+    _record_check(f, "stability", attempt)
+    completed, stopped_by, sample_rows = 0, None, None
+    durations: list[float] = []
+
+    def out_of_time() -> bool:
+        remaining = budget - (time.monotonic() - started)
+        return remaining <= 0 or bool(durations and max(durations) > remaining)
+
     if f.type == "temporal":
         rid, p = _runs(f)[0]
         points = pd.read_parquet(_store().path_of(rid))
         if not len(points):
-            return ToolResult.error("No anomalous points stored for this temporal finding.")
+            return _unmeasured(f, attempt, "no anomalous points stored for this temporal finding")
         windows = f.context.get("windows", [])
         group = {str(w["group"]) for w in windows}
         series = _rebuild_series(p)
@@ -276,6 +301,10 @@ def stability_check(
         groups = series["group"].unique()
         mine = points[points["group"].astype(str).isin(group)]
         for _ in range(n_runs):
+            if out_of_time():
+                stopped_by = "time budget"
+                break
+            tick = time.monotonic()
             keep = set(rng.choice(days, max(2, int(len(days) * 0.7)), replace=False))
             if p.get("model") == "grouped":
                 # Same model as the detector; bursts are compared with 70% of the other groups.
@@ -290,38 +319,128 @@ def stability_check(
                     series[series["group"].isin(group)], p["threshold"], keep_days=keep, unit=unit
                 )
             hits = mine.merge(again[["group", "ts"]], on=["group", "ts"], how="inner")
-            recalls.append(len(hits) / len(mine))
+            recalls.append(len(hits) / len(mine) if len(mine) else 0.0)
+            completed += 1
+            durations.append(time.monotonic() - tick)
     else:
         members = _members(f)
         try:
             source = feature_source()
         except SpecMissingError as exc:
             return ToolResult.error(str(exc))
-        population = read_features(source.scaled_path, source.entity, columns=[source.entity])[source.entity].tolist()
+        ids = read_features(source.scaled_path, source.entity, columns=[source.entity])[source.entity]
+        full_rows = len(ids)
+        # Large populations: the finding is re-detected among a seeded sample of the entities
+        # plus its own members. Each repetition then costs about the same whatever the size
+        # of the population, and quadratic methods (LOF, HDBSCAN) stay cheap.
+        cap = cfg.critic.stability_max_rows
+        estimate = _repetition_estimate(f, full_rows)
+        if estimate and estimate * min(cap / full_rows, 1.0) > budget:
+            cap = max(_MIN_STABILITY_ROWS, int(cap * budget / (estimate * min(cap / full_rows, 1.0)) * 0.8))
+        capped = full_rows > cap
+        if capped:
+            chosen = np.sort(np.random.default_rng(seed).choice(full_rows, cap, replace=False))
+            keep_rows = np.zeros(full_rows, dtype=bool)
+            keep_rows[chosen] = True
+            keep_rows |= ids.isin(members).to_numpy()
+            ids = ids[keep_rows]
+            sample_rows = len(ids)
+        if estimate:  # repetitions that fit the budget, from what the detector's methods took
+            per_repetition = estimate * len(ids) / full_rows
+            n_runs = max(1, min(n_runs, int(budget // max(per_repetition, 1e-9))))
+        population = ids.tolist()
         tables: dict[Any, Any] = {}
         for i in range(n_runs):
+            if out_of_time():
+                stopped_by = "time budget"
+                break
+            tick = time.monotonic()
             sample = set(rng.choice(population, int(len(population) * subsample), replace=False))
             sampled_members = members & sample
             if not sampled_members:
                 continue
-            # The i-th subsample is the same for every finding checked with this seed and share.
-            found = _redetect(
-                f, sample, int(seed) + i + 1, sample_key=(str(source.scaled_path), seed, subsample, i), tables=tables
-            )
+            # The i-th subsample is the same for every finding checked with this seed and share
+            # (not when the sample holds the finding's own members).
+            key = None if capped else (str(source.scaled_path), seed, subsample, i)
+            try:
+                found = run_with_timeout(
+                    _redetect,
+                    {"finding": f, "sample": sample, "seed": int(seed) + i + 1, "sample_key": key, "tables": tables},
+                    budget - (time.monotonic() - started),
+                    "stability-repetition",
+                )
+            except TimeoutError:
+                stopped_by = "timeout"
+                break
             recalls.append(len(sampled_members & found) / len(sampled_members))
             union = len(found | sampled_members)
             jaccards.append(len(found & sampled_members) / union if union else 0.0)
+            completed += 1
+            durations.append(time.monotonic() - tick)
+        if stopped_by is None and n_runs < requested:
+            stopped_by = "time budget"
+    extra: dict[str, Any] = {"runs_completed": completed, "runs_requested": requested, "subsample": subsample}
+    if sample_rows is not None:
+        extra["sample_rows"] = sample_rows
+    if stopped_by:
+        extra["stopped_by"] = stopped_by
     if not recalls:
-        return ToolResult.error("Stability could not be measured (no members in the subsamples).")
+        reason = "timeout" if stopped_by else "no members of the finding in the subsamples"
+        return _unmeasured(f, attempt | extra, reason)
     result = {
         "stability": round(float(np.mean(recalls)), 4),
         "stability_std": round(float(np.std(recalls)), 4),
         "runs": len(recalls),
-        "subsample": subsample,
         "mean_jaccard": round(float(np.mean(jaccards)), 4) if jaccards else None,
+        **extra,
     }
     _record_check(f, "stability", result)
-    return ToolResult.ok({"finding": f.id, **result, "min_stability_for_confirmed": _config().critic.min_stability})
+    warnings = (
+        [f"Stopped after {completed} of {requested} repetitions ({stopped_by}): the result uses those."]
+        if stopped_by
+        else []
+    )
+    return ToolResult.ok(
+        {"finding": f.id, **result, "min_stability_for_confirmed": cfg.critic.min_stability}, warnings=warnings
+    )
+
+
+_MIN_STABILITY_ROWS = 5000
+
+
+def _unmeasured(f: Finding, attempt: dict[str, Any], reason: str) -> ToolResult:
+    """Record that stability was attempted and could not be measured; the verdict is not blocked."""
+    result = attempt | {"stability": None, "reason": reason}
+    _record_check(f, "stability", result)
+    return ToolResult.ok(
+        {"finding": f.id, **result},
+        warnings=[
+            f"Stability could not be measured ({reason}). Do not call stability_check again for this finding: "
+            "continue with the other checks and set the verdict to 'weak' (or 'unstable'); 'confirmed' and "
+            "'explained' are not possible without a measured stability."
+        ],
+    )
+
+
+def _repetition_estimate(f: Finding, rows: int) -> float | None:
+    """Seconds one repetition on all ``rows`` would take, from the durations the detector recorded
+    for the finding's own runs (None when the trace does not have them)."""
+    path = current_run().trace_path
+    if not path.exists() or not rows:
+        return None
+    wanted = set(f.source_runs)
+    took: dict[str, float] = {}
+    with path.open(encoding="utf-8") as lines:
+        for line in lines:
+            if '"tool_call"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("artifact_id") in wanted and event.get("status") == "ok":
+                took[event["artifact_id"]] = float(event.get("duration_s") or 0.0)
+    return sum(took.values()) if took else None
 
 
 def _rebuild_series(p: dict[str, Any]) -> pd.DataFrame:
@@ -445,6 +564,11 @@ def _null_shares_by_reading(path: Any) -> dict[str, float]:
     return {name: table.column(name).null_count / table.num_rows for name in table.column_names}
 
 
+def _artifact_unmeasured(reason: str) -> dict[str, Any]:
+    """Record of an artifact check that was attempted and could not be measured."""
+    return {"suspected": False, "measured": False, "reason": reason, "reasons": [], "associations": []}
+
+
 def _association(name: str, finding_share: float, population_share: float, cfg: Any, **extra: Any) -> dict[str, Any]:
     lift = finding_share / population_share if population_share > 0 else (np.inf if finding_share > 0 else 1.0)
     suspicious = finding_share >= cfg.artifact_min_share and lift >= cfg.artifact_min_lift
@@ -535,6 +659,9 @@ def artifact_check(finding: str) -> ToolResult:
     entity = spec.entity.column if spec.entity else None
     associations: list[dict[str, Any]] = []
     reasons: list[str] = []
+    # Recorded as attempted before any work: a check that is stopped at the tool limit, or
+    # that cannot measure, must not leave the finding without a possible verdict.
+    _record_check(f, "artifact", _artifact_unmeasured("timeout"))
     con = connect()
     try:
         con.execute(f"CREATE TEMP VIEW src AS SELECT * FROM {relation}")
@@ -580,7 +707,15 @@ def artifact_check(finding: str) -> ToolResult:
             facts["rows"], facts["nulls"] = pop_row[0], dict(zip(columns, pop_row[1:], strict=True))
         n_pop = facts["rows"]
         if n_fin == 0:
-            return ToolResult.error("The finding matches no rows of the primary dataset.")
+            unmeasured = _artifact_unmeasured("the finding matches no rows of the primary dataset")
+            _record_check(f, "artifact", unmeasured)
+            return ToolResult.ok(
+                {"finding": f.id, **unmeasured},
+                warnings=[
+                    "The artifact check could not be measured: the finding matches no rows of the primary dataset. "
+                    "Do not repeat it; the verdict can be 'weak' or 'unstable', not 'confirmed' or 'explained'."
+                ],
+            )
 
         # 1) Source file concentration (entity findings only: temporal windows are trivially in their day file).
         if f.type != "temporal":
@@ -742,7 +877,7 @@ def artifact_check(finding: str) -> ToolResult:
             )
     suspected = bool(reasons)
     top = sorted(associations, key=lambda a: (-a["suspicious"], -a["lift"] * a["finding_share"]))[:8]
-    result = {"suspected": suspected, "reasons": reasons[:8], "associations": top}
+    result = {"suspected": suspected, "measured": True, "reasons": reasons[:8], "associations": top}
     if f.type != "temporal" and "n_events" in raw_columns:
         result["low_support_share"] = round(low_support_share, 4)
     _record_check(f, "artifact", result)
@@ -1269,7 +1404,30 @@ def set_verdict(finding: str, verdict: Verdict, evidence: dict[str, Any]) -> Too
         return ToolResult.error(str(exc))
     missing = [c for c in ("stability", "artifact") if c not in f.checks]
     if missing:
-        return ToolResult.error(f"Run {missing} before setting a verdict.")
+        return ToolResult.error(
+            f"Run {missing} before setting a verdict (call each once; a check that cannot measure records why "
+            "and still allows a verdict)."
+        )
+    if f.checks["artifact"].get("measured") is False:
+        # Attempted but not measured: nothing says the finding is clean of data artefacts.
+        why = f.checks["artifact"].get("reason", "unknown")
+        if verdict not in ("weak", "unstable"):
+            return ToolResult.error(
+                f"The artifact check was not measured ({why}): the verdict cannot be '{verdict}'. Use 'weak' or "
+                "'unstable'. Do not run artifact_check again with the same arguments."
+            )
+        evidence = {**evidence, "artifact": f"not measured ({why})"}
+    stability = f.checks["stability"].get("stability")
+    if stability is None and not f.checks["artifact"]["suspected"]:
+        # Attempted but not measured (timeout, no members): the finding still gets a verdict,
+        # but not one that claims stability.
+        why = f.checks["stability"].get("reason", "unknown")
+        if verdict not in ("weak", "unstable"):
+            return ToolResult.error(
+                f"Stability was not measured ({why}): the verdict cannot be '{verdict}'. Use 'weak' (the other "
+                "checks pass) or 'unstable'. Do not run stability_check again."
+            )
+        evidence = {**evidence, "stability": f"not measured ({why})"}
     if f.checks["artifact"]["suspected"] and verdict != "artifact":
         return ToolResult.error(
             "artifact_check suspected a data artefact: the verdict must be 'artifact'.",
@@ -1282,7 +1440,7 @@ def set_verdict(finding: str, verdict: Verdict, evidence: dict[str, Any]) -> Too
             "'explained' needs a legitimate cause found by explain_by_reference "
             f"({'not run yet' if not explanation else 'it found none'})."
         )
-    if verdict == "explained" and f.checks["stability"]["stability"] < minimum:
+    if verdict == "explained" and stability is not None and stability < minimum:
         return ToolResult.error(
             f"Stability {f.checks['stability']['stability']} is below {minimum}: an explained pattern must be "
             "stable (use 'unstable')."
@@ -1306,7 +1464,7 @@ def set_verdict(finding: str, verdict: Verdict, evidence: dict[str, Any]) -> Too
             f"{low_support:.0%} of the members have very few events (bottom 10% of activity): "
             "their features are unreliable, the verdict cannot be 'confirmed' (use 'weak')."
         )
-    if verdict == "confirmed" and f.checks["stability"]["stability"] < minimum:
+    if verdict == "confirmed" and stability is not None and stability < minimum:
         return ToolResult.error(
             f"Stability {f.checks['stability']['stability']} is below {minimum}: "
             "the verdict cannot be 'confirmed' (use 'unstable' or 'weak')."

@@ -26,7 +26,7 @@ from pydantic import Field
 
 from jellybean.runtime.context import current_run
 from jellybean.runtime.tool_registry import ToolResult, tool
-from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore
+from jellybean.skills._shared.artifacts import ArtifactNotFoundError, ArtifactStore, prefix_part
 from jellybean.skills._shared.catalog import SourceNotFoundError, connect, quote_ident, resolve_source
 from jellybean.skills._shared.column_stats import describe, type_family
 from jellybean.skills._shared.detection import (
@@ -61,6 +61,7 @@ OutlierMethod = Literal["isolation_forest", "lof", "ecod", "hbos", "autoencoder"
 ClusterMethod = Literal["hdbscan", "gmm", "kmeans"]
 GraphMethod = Literal["components", "communities", "centrality"]
 _MAX_SERIES_POINTS = 3_000_000
+_MIN_SERIES_BUCKETS = 8  # fewer time buckets than this cannot show what is usual
 
 
 def _store() -> ArtifactStore:
@@ -92,7 +93,7 @@ def _load_matrix(features: str, families: list[str] | None = None) -> tuple[pd.D
 
 def _save_run(kind: str, method: str, table: pd.DataFrame, parents: list[str], params: dict[str, Any]) -> str:
     record = _store().save_dataframe(
-        f"detection_{method}", table, parents=parents, params={"kind": kind, "method": method, **params}
+        f"detection_{prefix_part(method)}", table, parents=parents, params={"kind": kind, "method": method, **params}
     )
     return record.id
 
@@ -186,7 +187,8 @@ def run_clustering(
     Args:
         features: Embedding or scaled feature table.
         method: hdbscan (default parameters: min_cluster_size 10), gmm or kmeans.
-        params: Method parameters, e.g. {"min_cluster_size": 10} or {"n_clusters": 12}.
+        params: Method parameters, e.g. {"min_cluster_size": 10} or {"n_clusters": 12}. For hdbscan,
+            {"max_rows": 50000} fits on a smaller seeded sample (use it after a timeout).
         seed: Random seed (defaults to the run seed).
     """
     cfg = _cfg()
@@ -375,19 +377,27 @@ def run_timeseries_anomaly(
         schema = dict(describe(con, source.view))
         for col in [time_column, group_by] + ([] if measure == "count" else [measure]):
             if col and col not in schema:
-                return ToolResult.error(f"Unknown column '{col}'.")
+                return ToolResult.error(f"Unknown column '{col}'. Columns: {list(schema)[:40]}")
         if measure != "count" and type_family(schema[measure]) not in ("integer", "float"):
-            return ToolResult.error(f"Measure '{measure}' is not numeric.")
+            numeric = [c for c, kind in schema.items() if type_family(kind) in ("integer", "float")]
+            return ToolResult.error(
+                f"Measure '{measure}' is not numeric. Use \"count\" or one of the numeric columns: {numeric[:20]}"
+            )
         t, g = quote_ident(time_column), quote_ident(group_by) if group_by else "'__all__'"
         value = "count(*)" if measure == "count" else f"sum({quote_ident(measure)})"
         n_groups = con.execute(f"SELECT count(DISTINCT {g}) FROM {source.view}").fetchall()[0][0]
         n_buckets = con.execute(
             f"SELECT count(DISTINCT date_trunc('{granularity}', {t})) FROM {source.view}"
         ).fetchall()[0][0]
+        if n_buckets == 0:
+            return ToolResult.error(
+                f"No time series can be built: no row has a value in '{time_column}'. Skip the time-series step "
+                "(or use another time column) and continue with the other methods."
+            )
         if n_groups * n_buckets > _MAX_SERIES_POINTS:
             return ToolResult.error(
-                f"{n_groups} groups x {n_buckets} buckets is too many series points; "
-                "group by a lower-cardinality column."
+                f"{n_groups} groups x {n_buckets} buckets is too many series points (limit {_MAX_SERIES_POINTS}). "
+                "Next: group by a column with fewer values, use granularity 'day', or leave group_by out."
             )
         series = con.execute(
             f"SELECT CAST({g} AS VARCHAR) AS \"group\", date_trunc('{granularity}', {t}) AS ts, {value} AS value, "
@@ -427,7 +437,7 @@ def run_timeseries_anomaly(
         for w in windows
     ]
     run_id = store.save_dataframe(
-        f"detection_ts_{measure}",
+        f"detection_ts_{prefix_part(measure)}",
         points_table,
         parents=[source.name],
         params={
@@ -455,8 +465,26 @@ def run_timeseries_anomaly(
         }
         for w in window_json[:5]
     ]
+    # An empty table of anomalous points is a result, not a failure: say which.
+    warnings = []
+    if n_buckets < _MIN_SERIES_BUCKETS:
+        warnings.append(
+            f"Only {n_buckets} {granularity} buckets: too few to tell what is usual, so nothing can stand out. "
+            + ("Use granularity 'hour'." if granularity == "day" else "The period is too short for this test.")
+        )
+    if len(points):
+        outcome = f"{len(points)} anomalous {granularity} buckets in {len(windows)} windows"
+    elif warnings:
+        outcome = "no anomalous buckets could be found: too few time buckets (see warnings)"
+    else:
+        outcome = (
+            f"no anomalous buckets: none of the {n_points} {granularity} buckets is {threshold:g} robust "
+            "deviations above its usual value. This is a valid result (the run has no rows)."
+        )
     return ToolResult.ok(
         {
+            "measure": measure,
+            "result": outcome,
             "series": int(series["group"].nunique()),
             "points": n_points,
             "anomalous_points": len(points),
@@ -465,6 +493,7 @@ def run_timeseries_anomaly(
             "top_windows": shown,
         },
         artifact_id=run_id,
+        warnings=warnings,
     )
 
 
@@ -603,18 +632,27 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     """
     cfg = _cfg()
     store = _store()
-    try:
-        runs = [(rid, store.get(rid)) for rid in run_ids]
-    except ArtifactNotFoundError as exc:
-        return ToolResult.error(f"Unknown run: {exc}")
+    # A method that failed or timed out left no run: ids that are not detection runs of
+    # this run are left out and reported, they do not stop the consolidation.
+    runs, ignored = [], []
+    for rid in dict.fromkeys(run_ids):
+        if store.exists(rid) and store.get(rid).params.get("kind"):
+            runs.append((rid, store.get(rid)))
+        else:
+            ignored.append(rid)
     kinds: dict[str, list[tuple[str, Any]]] = {}
     for rid, record in runs:
         kind = record.params.get("kind")
-        if kind is None:
-            return ToolResult.error(f"'{rid}' is not a detection run.")
         kinds.setdefault(kind, []).append((rid, record))
     if len(kinds.get("outlier", [])) < 2 or not kinds.get("cluster"):
-        return ToolResult.error("Use at least two outlier methods and one clustering method before consolidating.")
+        have = {k: len(v) for k, v in kinds.items()}
+        return ToolResult.error(
+            "Consolidation needs at least two outlier runs and one clustering run. "
+            f"Valid runs given: {have or 'none'}"
+            + (f"; not detection runs of this run (failed or timed out?): {ignored}" if ignored else "")
+            + ". Next: for outliers run run_outlier_detector with isolation_forest and ecod; for clustering run "
+            'run_clustering with method "kmeans" (it always finishes), then call consolidate_findings again.'
+        )
     try:
         source = feature_source()
     except SpecMissingError as exc:
@@ -624,6 +662,8 @@ def consolidate_findings(run_ids: Annotated[list[str], Field(min_length=1)]) -> 
     n_entities = source.n_rows()
     candidates: list[dict[str, Any]] = []
     warnings: list[str] = []
+    if ignored:
+        warnings.append(f"Ignored (not detection runs of this run; a failed or timed-out call leaves none): {ignored}")
 
     def space_of(pool: list[Any], columns: list[str] | None = None) -> pd.DataFrame:
         """Scaled features of the pooled entities only (the grouping reads no other row)."""

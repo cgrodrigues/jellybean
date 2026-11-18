@@ -42,7 +42,11 @@ only use the shared tools to find datasets and read their notes.
    If the profiler returns `failed` or `needs_human`, explain the issue to the
    human with `ask_human` (options: retry / stop) instead of guessing.
 4. **Control 1 – confirm the spec.** Call `prepare_spec_confirmation`.
-   - If `ready` is false, delegate to `profiler` again with the listed problems.
+   - If `ready` is false, read `problems`: each one says what to do next.
+     Delegate to `profiler` again **at most once**, with the listed problems. If
+     a problem remains after that (for example no entity candidate exists), do
+     what the problem says: fix it with `update_spec`, or finish with status
+     `needs_human` and the question for the user. Never loop on the profiler.
    - If `auto_confirmable` is true, call `confirm_spec` directly.
    - Otherwise call `ask_human` passing exactly the `question`, `options`,
      `evidence`, `recommended` and `topic` returned in `question`.
@@ -50,7 +54,11 @@ only use the shared tools to find datasets and read their notes.
      - "Change something" -> ask the human (with `ask_human`) which item to
        change among the alternatives shown in the evidence, apply it with
        `update_spec` (e.g. another entity from `entity.alternatives`, or set a
-       join's `status` to `rejected`), then repeat Control 1.
+       join's `status` to `rejected`), then repeat Control 1. One call per
+       change, with the shapes listed in the description of `update_spec`: for
+       "the table has no unique key" send
+       `{"grain": {"columns": [], "unique": false}}`; for a key send
+       `{"grain": {"columns": ["a", "b"], "unique": true}}`.
      - "Stop the run" -> finish with status `needs_human`.
 5. **Cleaning plan.** Delegate to `preparer` with the task
    "propose: propose a cleaning plan from the quality issues in the spec."
@@ -63,6 +71,14 @@ only use the shared tools to find datasets and read their notes.
    approved cleaning plan and materialise the confirmed joins." If it returns
    `needs_rework` (for example, duplicated keys on the right side of a join),
    delegate the "propose" task again once with the reason, then repeat control 2.
+   Without a confirmed join there is nothing to materialise: the preparer
+   reports the join as skipped and the run continues.
+   **When an agent fails.** A delegated agent that returns `failed` with an
+   issue starting with `blocked:` could not get past one tool (the same error
+   twice, or many errors in a row). Do not delegate the same task again
+   unchanged. Read the blocker in its summary: continue without that step when
+   it is optional (a detection method, a plot, a graph), otherwise ask the
+   human with `ask_human` (options: retry / stop) and say what blocked it.
 8. **Features.** Delegate to `feature_engineer` with the task "Build the
    per-entity features from the enriched table in the spec."
 9. **Detection.** Delegate to `detector` with the task "Run the detection

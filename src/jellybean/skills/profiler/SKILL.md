@@ -28,7 +28,13 @@ artifact id. Keep every artifact id: you will need them at the end.
 2. For **every** dataset: `read_dataset_notes`, `profile_table`,
    `infer_semantic_types`.
 3. For the **primary** dataset:
-   - `infer_grain`.
+   - `infer_grain`. When it reports `unique_key: false`, the table has **no
+     unique key**: it is an event-level table, where several rows per entity and
+     timestamp are legitimate (the two legs of one call, for example). This is a
+     valid result. Pass that same artifact to `propose_spec`, which records the
+     grain as "no unique key". Do **not** look for a key by adding columns until
+     the rows look unique, do not pass a `find_duplicate_keys` artifact as grain,
+     and do not write the grain by hand with `update_spec`.
    - `suggest_entities`. If the spec's `entity` has `source: user`, the user
      already chose it: keep it (`propose_spec` will not overwrite it), and use
      the suggestions only as context.

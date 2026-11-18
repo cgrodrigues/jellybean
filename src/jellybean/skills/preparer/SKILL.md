@@ -16,8 +16,14 @@ You work in two separate assignments. The task text tells you which one.
 # Assignment A: "propose" a cleaning plan
 
 1. `get_spec`. The quality issues artifact is `evidence_artifacts.quality_issues`.
-2. `propose_cleaning_plan` with that artifact id. The tool derives one justified
-   operation per issue and records the plan in the spec as "proposed".
+2. `propose_cleaning_plan` with that artifact id (or with no argument: it then
+   uses the one in the spec). The tool derives one justified operation per
+   issue and records the plan in the spec as "proposed". When there are no
+   quality issues the plan is empty: that is a valid plan, report it as such.
+   - On a table with **no unique key** (`grain.unique` is false), repeated rows
+     can be distinct events. The tool proposes the removal of exact duplicate
+     rows only as an operation that needs explicit approval, and never a dedupe
+     keyed on the grain columns. Do not add one.
    - Review every operation in the result (each lists its `issue_ids` and
      justification). Use `read_json_artifact` to read the full plan or the
      quality issues. JSON artifacts cannot be queried with `run_sql`.
@@ -44,7 +50,9 @@ Do not apply anything in this assignment: control 2 (human approval) comes next.
 4. For each confirmed join in the spec, in order, call
    `materialize_join(join_index=i)`. To chain several joins, pass the previous
    result as `left_artifact`. Unmatched rows are kept and flagged in
-   `matched_<right>`.
+   `matched_<right>`. If the spec has no confirmed join, call
+   `materialize_join()` once: it reports `skipped` and moves the run on; the
+   feature engineer then uses the cleaned primary dataset.
 5. `finish` with status `done`, the enriched artifact id, the cleaned artifact
    ids and the transform-log ids. Summarise the rows removed per operation, the
    join coverage and the number of unmatched rows.

@@ -24,13 +24,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from jellybean.runtime.cancellation import check_cancelled
 from jellybean.runtime.context import RunContext, current_run
 from jellybean.runtime.tool_registry import current_tool, to_jsonable
 
 ArtifactType = Literal["table", "json", "plot", "text"]
 
 # Artifact ids double as DuckDB view names, so they must be plain identifiers.
-_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]{0,60}$")
+_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_]{0,150}$")
 _ID_RE = re.compile(r"^([a-z][a-z0-9_]{0,60})_v(\d+)$")
 
 _EXTENSIONS: dict[str, str] = {"table": "parquet", "json": "json", "plot": "png", "text": "md"}
@@ -59,6 +60,18 @@ class ArtifactRecord(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     row_count: int | None = None
     created_at: str
+
+
+def prefix_part(name: str) -> str:
+    """Turn a column, dataset, method or user-supplied name into a valid piece of an artifact prefix.
+
+    Lower case; every run of characters outside ``[a-z0-9_]`` becomes one ``_``;
+    trimmed to 40 characters. Names that differ only by case or punctuation give
+    the same piece: their artifacts then differ by version (``_v1``, ``_v2``), and
+    the original name must be kept in the artifact's params.
+    """
+    part = re.sub(r"_+", "_", re.sub(r"[^a-z0-9_]+", "_", str(name).lower())).strip("_")
+    return part[:40].rstrip("_") or "x"
 
 
 def slugify(text: str) -> str:
@@ -166,12 +179,20 @@ class ArtifactStore:
             parents: Ids of artifacts or dataset names this one derives from.
             params: Parameters that produced it (kept for reproducibility).
         """
+        # A call that timed out leaves nothing behind: work that could not be interrupted
+        # may still reach this point after the caller was told about the timeout.
+        check_cancelled()
         artifact_id = self._reserve_id(prefix)
         rel_path = Path("artifacts") / f"{artifact_id}.{_EXTENSIONS[type_]}"
         abs_path = self.ctx.run_dir / rel_path
         try:
             abs_path.parent.mkdir(parents=True, exist_ok=True)
             row_count = writer(abs_path)
+            try:
+                check_cancelled()
+            except BaseException:
+                abs_path.unlink(missing_ok=True)
+                raise
             # Make the file read-only: artifacts are immutable.
             abs_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
             record = ArtifactRecord(

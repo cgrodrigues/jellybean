@@ -26,6 +26,15 @@ profiling:                         # keeps the profiler's checks cheap on large 
   sample_rows: 200000              # candidate relations are screened on a sample of about this size first
   candidate_batch: 60              # candidate relations tested per SQL statement
 
+  # tool_timeouts:                 # timeout of single tools, overriding tool_timeout_s
+  #   run_clustering: 900
+  max_consecutive_tool_errors: 6   # an agent whose tool calls fail this many times in a row is stopped as blocked
+  isolate_above_rows: 20000        # model fits on more rows run in a worker process, killed at the timeout (null = never)
+
+features:
+  window_max_rows: 200000000       # (entity, hour) or (entity, day) rows of the per-level window features; above it the window is skipped
+  window_max_levels: 60            # category levels expanded into window features, over all columns
+
 llm:                               # provider, model and key are set in .env
   max_tokens: 4096                 # max output tokens per model call
   temperature: null                # null = provider default
@@ -56,7 +65,7 @@ detection:
   max_family_findings: 16          # ...with their own cap, on top of max_findings
   merge_overlap: 0.8               # merge findings when this share of the smaller one overlaps
   ts_threshold: 6.0                # robust z-score for time-series anomalies
-  cluster_max_rows: 200000         # HDBSCAN is fitted on a seeded sample above this many entities
+  cluster_max_rows: 75000          # HDBSCAN is fitted on a seeded sample above this many entities (time grows with rows squared)
   group_max_pool: 10000            # most deviating pooled outliers grouped (pairwise distances: n^2 memory)
   plot_max_points: 50000           # population points drawn in a scatter plot (members are always drawn)
   fit_max_rows: 500000             # above this, outlier models are fitted on a seeded sample and score the rest in batches
@@ -68,6 +77,8 @@ detection:
 critic:
   min_stability: 0.6               # a finding below this stability cannot be "confirmed"
   stability_runs: 5                # repetitions with other seeds/subsamples
+  stability_budget_share: 0.6      # share of the tool timeout stability_check may use before returning what it has
+  stability_max_rows: 50000        # entities used to re-detect a finding (seeded sample plus its members)
   artifact_min_share: 0.5          # share of a finding explained by a source (file, nulls, cleaning op)
   artifact_min_lift: 5.0           # ... and its lift over the population, to suspect an artifact
 

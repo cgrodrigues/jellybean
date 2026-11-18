@@ -48,6 +48,7 @@ import duckdb
 from pydantic import Field
 
 from jellybean.runtime.tool_registry import ToolResult, tool
+from jellybean.skills._shared.artifacts import prefix_part
 from jellybean.skills._shared.catalog import SourceNotFoundError, connect, quote_ident, resolve_source
 from jellybean.skills._shared.column_stats import ColumnStats, classify_column, compute_column_stats
 from jellybean.skills._shared.keys import is_valid_strategy, strategy_sql
@@ -544,7 +545,7 @@ def discover_arithmetic_invariants(
     for inv in held:
         inv.pop("holds"), inv.pop("present")
     record = _store().save_json(
-        f"invariants_{source.name}",
+        f"invariants_{prefix_part(source.name)}",
         {"dataset": source.name, "rows": rows, "measures": measures, "invariants": held, "issues": issues},
         parents=[source.name],
         params={"min_share": min_share},
@@ -692,7 +693,7 @@ def check_referential_integrity(
         "orphan_examples": [masker.mask_value(v) if sensitive else v for v in examples],
     }
     record = _store().save_json(
-        f"reference_{src.name}_{column}",
+        f"reference_{prefix_part(src.name)}_{prefix_part(column)}",
         {
             **result,
             "reference": {"dataset": src.name, "column": column, "ref_dataset": ref.name, "ref_column": ref_column},
@@ -800,7 +801,7 @@ def find_duplicate_keys(dataset: str, columns: list[str] | None = None, min_uniq
     finally:
         _close(con)
     record = _store().save_json(
-        f"duplicate_keys_{source.name}",
+        f"duplicate_keys_{prefix_part(source.name)}",
         {"dataset": source.name, "checks": checks, "issues": issues},
         parents=[source.name],
     )
@@ -882,7 +883,9 @@ def classify_nulls(dataset: str) -> ToolResult:
     finally:
         _close(con)
     record = _store().save_json(
-        f"nulls_{source.name}", {"dataset": source.name, "nulls": results, "issues": issues}, parents=[source.name]
+        f"nulls_{prefix_part(source.name)}",
+        {"dataset": source.name, "nulls": results, "issues": issues},
+        parents=[source.name],
     )
     compact = {
         name: {
@@ -1023,7 +1026,7 @@ def infer_sign_convention(dataset: str, measure: str, category: str) -> ToolResu
             )
         )
     record = _store().save_json(
-        f"sign_{source.name}_{measure}",
+        f"sign_{prefix_part(source.name)}_{prefix_part(measure)}",
         {
             "dataset": source.name,
             "measure": measure,
@@ -1117,7 +1120,9 @@ def discover_self_references(dataset: str, min_coverage: float = 0.9) -> ToolRes
     finally:
         _close(con)
     record = _store().save_json(
-        f"self_references_{source.name}", {"dataset": source.name, "candidates": found}, parents=[source.name]
+        f"self_references_{prefix_part(source.name)}",
+        {"dataset": source.name, "candidates": found},
+        parents=[source.name],
     )
     return ToolResult.ok({"dataset": source.name, "candidates": found[:10]}, artifact_id=record.id, warnings=notes)
 
@@ -1217,7 +1222,7 @@ def check_reciprocity(
     if swapped:
         result["note"] = f"columns swapped: '{counterpart_column}' is the sparse column, the other party"
     record = _store().save_json(
-        f"reciprocity_{source.name}_{counterpart_column}",
+        f"reciprocity_{prefix_part(source.name)}_{prefix_part(counterpart_column)}",
         {
             **result,
             "reference": {
