@@ -15,6 +15,8 @@ limits:
   duckdb_memory_limit: 4GB         # per DuckDB connection; above it queries spill to <run>/tmp (null = 80% of RAM)
   duckdb_threads: 4                # threads per DuckDB connection (null = all cores)
   duckdb_max_temp_size: 50GB       # cap on data spilled to disk (null = DuckDB default)
+  max_consecutive_tool_errors: 6   # an agent whose tool calls fail this many times in a row is stopped as blocked
+  isolate_above_rows: 20000        # model fits on more rows run in a worker process, killed at the timeout (null = never)
 
 tool_output:
   max_output_chars: 4000           # hard cap on a serialised ToolResult
@@ -28,9 +30,7 @@ profiling:                         # keeps the profiler's checks cheap on large 
 
   # tool_timeouts:                 # timeout of single tools, overriding tool_timeout_s
   #   run_clustering: 900
-  max_consecutive_tool_errors: 6   # an agent whose tool calls fail this many times in a row is stopped as blocked
-  isolate_above_rows: 20000        # model fits on more rows run in a worker process, killed at the timeout (null = never)
-
+  
 features:
   window_max_rows: 200000000       # (entity, hour) or (entity, day) rows of the per-level window features; above it the window is skipped
   window_max_levels: 60            # category levels expanded into window features, over all columns
