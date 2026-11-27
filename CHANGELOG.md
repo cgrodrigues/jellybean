@@ -23,6 +23,8 @@ All notable changes to this project are recorded here. The format follows
 - `docs/performance-audit.md`: memory and CPU review of the whole pipeline.
 - `pytz`, so that DuckDB can return `TIMESTAMP WITH TIME ZONE` values.
 
+- Results explorer (`jellybean ui`, optional extra `ui`): a local, read-only web
+  view of the runs, their report, findings, tables and steps.
 - A table with no unique key is a valid grain (`grain.unique: false`), shown as
   "no unique key" at the spec confirmation and never used to remove duplicates.
 - `build_entity_features` has an `hour` window: counts per category level and

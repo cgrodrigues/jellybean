@@ -466,6 +466,47 @@ def outputs(
         _print_outputs(ctx, items, kind)
 
 
+@app.command("ui")
+def ui(
+    port: Annotated[int, typer.Option(help="Port of the local web server.")] = 8501,
+    open_browser: Annotated[bool, typer.Option("--open/--no-open", help="Open the browser.")] = True,
+) -> None:
+    """Open the results explorer: a local, read-only web view of the runs in the workspace.
+
+    Runs, their report, findings (with members and their events), every table
+    (filter, sort, SQL) and the steps executed. It only listens on localhost.
+    Needs the optional extra: ``uv sync --extra ui``.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("streamlit") is None:
+        typer.secho("The explorer needs Streamlit: run `uv sync --extra ui`.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    script = Path(__file__).parent / "ui" / "app.py"
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(script),
+        "--server.address",
+        "localhost",
+        "--server.port",
+        str(port),
+        "--server.headless",
+        "false" if open_browser else "true",
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+    typer.echo(f"Explorer on http://localhost:{port} (workspace: {get_settings().workspace_root}). Ctrl+C to stop.")
+    try:
+        raise typer.Exit(code=subprocess.call(command))
+    except KeyboardInterrupt:
+        raise typer.Exit(code=0) from None
+
+
 def ctx_is_topup(ctx: Any) -> bool:
     """True when the run's primary dataset is the top-up ledger (it has its own ground truth)."""
     from jellybean.spec import load_spec

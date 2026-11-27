@@ -178,6 +178,30 @@ uv run jellybean resume <run_id>            # continues from the phase recorded 
 | `outputs <run_id> [--type table\|plot\|json] [--json]` | Lists the datasets and other artifacts of a run, grouped by agent, with their paths |
 | `evaluate <run_id>... [--json]` | Compares runs with the ground truth (telecom: spec section 10; top-up: `requirements_2.md` section 11), writes `evaluation.json` per run; several runs (one per entity) are also combined |
 
+## Results explorer
+
+A local, read-only web view of the runs in the workspace, to navigate the
+results of the runs made on the command line:
+
+```bash
+uv sync --extra ui      # once: installs Streamlit
+uv run jellybean ui     # http://localhost:8501 (--port, --no-open)
+```
+
+| View | What it shows |
+| --- | --- |
+| Runs | Every run: instruction, primary dataset, entity, phase, status, findings and how many were confirmed. |
+| Overview | The report with its plots, the confirmed spec (datasets, joins, grain, entity, time column) and the decisions taken at the control points. |
+| Findings | Filter by verdict and type. For a finding: the features that set it apart, its rules, the critic's checks, its plots, its members with their features next to the population medians, and the raw events of any member. |
+| Tables | Any table artifact or dataset: schema, filter (a SQL condition), sort and pages of 200 rows, plus a read-only SQL box over all the tables of the run. Rows can be downloaded as CSV. |
+| Steps | Every tool call with its duration, status and error; time per tool and tokens per agent. |
+
+It never writes to a run, so it can stay open while a run is in progress
+("Reload" re-reads the files). It listens on `localhost` only and shows the
+data **as stored**: the "Mask personal data" switch hides identifiers the way
+the agents see them, for when the screen is shared. Tables are paged and
+filtered in DuckDB, so a table of millions of rows is never loaded whole.
+
 ## How a run works
 
 1. **Interpretation.** The orchestrator resolves the datasets in the
@@ -638,6 +662,7 @@ uv run ruff check . && uv run ruff format --check .
 │   ├── settings.py               # .env + config.yaml
 │   ├── spec.py                   # spec.yaml schema, patching, join-confidence rules
 │   ├── reporting.py              # report.md
+│   ├── ui/                       # results explorer (`jellybean ui`): data.py (read-only access), app.py (Streamlit)
 │   ├── evaluation.py             # comparison with the ground truth
 │   ├── runtime/
 │   │   ├── context.py            # active run (run id, folders, seed)
