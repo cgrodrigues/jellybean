@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Detection and critique on the top-up ledger, one analysis per entity (requirements_2.md, phase 5).
+"""Detection and critique on the top-up ledger, one analysis per entity.
 
 On top of discovery and cleaning (as in test_topup_features), each entity is
 analysed the way the SKILL.md files prescribe: features with the typed-event
@@ -249,7 +249,7 @@ def test_explanations_never_cover_planted_anomalies(run: dict[str, Any]) -> None
 
 # --------------------------------------------------------------------- evaluation
 def test_topup_acceptance_criteria(run: dict[str, Any]) -> None:
-    """Section 11 of requirements_2.md, from `jellybean evaluate` over the per-entity runs."""
+    """The top-up acceptance criteria, from `jellybean evaluate` over the per-entity runs."""
     combined = run["combined"]
     acceptance = combined["acceptance"]
     print(format_combined(combined))

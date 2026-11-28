@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Feature engineer tools (spec section 7.4).
+"""Feature engineer tools.
 
 Builds the per-entity table from the (enriched) event table using one feature
 template per semantic type:

@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Analyst tools (spec section 7.7).
+"""Analyst tools.
 
 Describe confirmed findings in understandable terms: the features that differ
 most from the population (with effect sizes), a shallow decision tree that

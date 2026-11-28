@@ -5,7 +5,7 @@
 
 Runs detector -> critic checks -> verdicts -> analyst -> pattern registry with
 the deterministic tools, on top of the shared phase-4 pipeline, and checks the
-acceptance criteria of spec section 10 that do not need an LLM:
+acceptance criteria that do not need an LLM:
 
 * at least 4 of the planted anomalies have recall >= 0.6 in confirmed findings;
 * the unit-error trap gets the verdict "artifact";
@@ -49,7 +49,7 @@ def test_recall_of_planted_anomalies(phase5: dict) -> None:
             found |= _members(ctx, f)
     recall = {a: len(set(block.entity_id) & found) / len(block) for a, block in gt.groupby("anomaly_id")}
     traffic = {a: r for a, r in recall.items() if a != "D"}  # D lives in orders (another run)
-    # On failure, show where each anomaly was lost (spec section 10).
+    # On failure, show where each anomaly was lost.
     with use_run(ctx):
         trail = [
             (

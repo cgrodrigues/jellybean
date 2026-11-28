@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""``report.md``: the final, deterministic report of a run (spec sections 8 and 12).
+"""``report.md``: the final, deterministic report of a run.
 
 The report is assembled from the workspace only: spec, decisions, cleaning
 plan, join, features, findings and trace. The only free text written by an LLM

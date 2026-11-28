@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Orchestrator tools (spec section 7.1).
+"""Orchestrator tools.
 
 The orchestrator interprets the instruction, keeps the plan and the spec,
 delegates to other agents and runs the human control points. It never touches
@@ -123,7 +123,7 @@ def delegate(agent: str, task: str, artifact_ids: list[str] | None = None) -> To
         task = f"Try to refute finding {task.strip()}."
     if len(task) > 2000:
         return ToolResult.error("Task text is too long (max 2000 chars); pass artifact ids instead of content.")
-    # Rework limit (spec section 4): detection and each finding's critique may run
+    # Rework limit: detection and each finding's critique may run
     # at most 1 + max_rework_cycles times.
     limit = 1 + current_run().settings.config.limits.max_rework_cycles
     key = f"critico:{task}" if agent == _CRITIC else agent if agent == "detector" else None
@@ -192,7 +192,7 @@ def ask_human(
 
 
 # --------------------------------------------------------------------------- #
-# Control 1                                                                    #
+# Control 1                                                                   #
 # --------------------------------------------------------------------------- #
 def _spec_checks(spec: AnalysisSpec, store: ArtifactStore) -> tuple[list[dict[str, Any]], list[str]]:
     """Evaluate each spec item against its evidence. Returns (items, problems)."""
@@ -411,7 +411,7 @@ def confirm_spec(note: str = "") -> ToolResult:
 
 
 # --------------------------------------------------------------------------- #
-# Control 2                                                                    #
+# Control 2                                                                   #
 # --------------------------------------------------------------------------- #
 CLEANING_TOPIC = "cleaning_approval"
 APPROVE_RECOMMENDED = "Approve recommended plan"
@@ -518,7 +518,7 @@ def approve_cleaning_plan() -> ToolResult:
 
 
 # --------------------------------------------------------------------------- #
-# Control 3                                                                    #
+# Control 3                                                                   #
 # --------------------------------------------------------------------------- #
 REVIEW_PREFIX = "finding_review:"
 FEEDBACK_CONFIRMED = "Confirmed pattern"
@@ -576,7 +576,7 @@ def review_findings() -> ToolResult:
 
 
 # --------------------------------------------------------------------------- #
-# Report                                                                       #
+# Report                                                                      #
 # --------------------------------------------------------------------------- #
 @tool
 def write_report() -> ToolResult:

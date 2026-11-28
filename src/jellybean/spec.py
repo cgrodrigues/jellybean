@@ -4,7 +4,7 @@
 """Schema of ``spec.yaml``: the analysis specification and source of truth of a run.
 
 The spec is written by the orchestrator and the profiler and read by every
-agent (spec section 6). All writes go through :func:`apply_patch`, which merges
+agent. All writes go through :func:`apply_patch`, which merges
 a partial update and validates the result, so an invalid spec can never be
 stored.
 
@@ -391,7 +391,7 @@ def record_decision(spec: AnalysisSpec, decision: Decision) -> AnalysisSpec:
 
 
 # --------------------------------------------------------------------------- #
-# Join confidence (spec section 8)                                            #
+# Join confidence                                                             #
 # --------------------------------------------------------------------------- #
 class JoinAssessment(_Model):
     """Outcome of the join-confidence rules."""
@@ -424,9 +424,8 @@ def assess_join(
     when the score margin over the runner-up is missing or below the threshold.
     It is a ranking aid; the decision itself uses the criteria.
 
-    Coverage is measured on rows with a non-null key (section 10.3 of
-    ``requirements_2.md``). A sparse key, with more null keys than the coverage
-    tolerance, can still be auto-confirmed when its nulls are structural
+    Coverage is measured on rows with a non-null key. A sparse key, with more
+    null keys than the coverage tolerance, can still be auto-confirmed when its nulls are structural
     (decided by another column); otherwise it needs a human.
     """
     criteria = {

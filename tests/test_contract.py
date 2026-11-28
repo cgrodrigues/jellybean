@@ -91,7 +91,7 @@ CALLS = [
     ("normalize_key", {"dataset": "events", "column": "phone", "match_against": "customers.customer_id"}),
     ("correlation_summary", {"dataset": "wide"}),
     ("compile_quality_issues", {"artifact_ids": ["missing_v1"]}),
-    # Integrity checks (requirements_2.md 10.2)
+    # Integrity checks
     ("discover_arithmetic_invariants", {"dataset": "wide"}),
     ("discover_arithmetic_invariants", {"dataset": "events", "columns": ["amount", "nope"]}),
     (
@@ -134,7 +134,7 @@ CALLS = [
     ("scale_encode", {"features": "missing_v1"}),
     ("reduce_dimensions", {"features": "missing_v1"}),
     ("feature_summary", {"features": "missing_v1"}),
-    # Typed-event feature models (requirements_2.md 10.4); good paths in test_topup_features
+    # Typed-event feature models; good paths in test_topup_features
     (
         "build_category_features",
         {"input": "events", "entity": "phone", "category": "event_id", "measure": "amount", "features": "missing_v1"},

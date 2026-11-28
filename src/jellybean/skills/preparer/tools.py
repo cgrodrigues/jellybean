@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparer tools (spec section 7.3).
+"""Preparer tools.
 
 The preparer proposes a justified cleaning plan from the profiler's quality
 issues, applies it once approved (control 2) and materialises the confirmed
@@ -423,7 +423,7 @@ def _run_transform(
 
 
 # --------------------------------------------------------------------------- #
-# Tools                                                                        #
+# Tools                                                                       #
 # --------------------------------------------------------------------------- #
 def _semantic_type(spec: Any, dataset: str, column: str) -> str | None:
     for key in (column, f"{dataset}.{column}"):

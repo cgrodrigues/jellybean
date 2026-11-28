@@ -5,7 +5,7 @@
 
 One line per LLM call (tokens, duration) and per tool call (arguments, output
 size, raw rows returned, duration, artifact created). Tool outputs are never
-written here, only arguments and sizes (privacy requirement, section 11).
+written here, only arguments and sizes (privacy requirement).
 
 Error messages are recorded: a failed tool call carries a short ``error`` text
 (cut to ``_MAX_ARG_CHARS``, with values that look like personal data masked), so

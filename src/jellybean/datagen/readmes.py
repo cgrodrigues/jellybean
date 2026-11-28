@@ -60,7 +60,7 @@ Online and in-store orders of the operator's shop, one row per order.
 
 
 # --------------------------------------------------------------------------- #
-# Top-up ledger (requirements_2.md section 9)                                 #
+# Top-up ledger                                                               #
 # --------------------------------------------------------------------------- #
 _MOVEMENT_MEANINGS = {
     "RCH_VOUCHER": "recharge with a voucher (PIN); credit to MAIN",
