@@ -3,8 +3,8 @@
 
 """Command line interface (``jellybean ...``).
 
-Commands: ``generate-data``, ``datasets``, ``run``, ``resume``, ``report``,
-``feedback`` and ``evaluate``.
+Commands: ``generate-data``, ``datasets``, ``snapshot``, ``snapshots``, ``run``,
+``resume``, ``report``, ``feedback``, ``outputs``, ``ui`` and ``evaluate``.
 """
 
 from __future__ import annotations
@@ -265,7 +265,7 @@ def _print_outputs(ctx, outputs: list[dict], kind: str | None = None) -> None:
         typer.echo(f"  + {documents} document(s): jellybean outputs {ctx.run_id} --type json")
 
 
-def _open_run(run_id: str):
+def _open_run(run_id: str, need_data: bool = False):
     from jellybean.runtime.context import RunContext
     from jellybean.spec import load_spec
 
@@ -275,7 +275,87 @@ def _open_run(run_id: str):
         typer.secho(f"Run '{run_id}' not found (no {path}).", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
     spec = load_spec(path)
-    return RunContext.open(settings, run_id, seed=spec.seed, filters=spec.filters), spec
+    source = None
+    if spec.source:
+        from jellybean.sources.snapshot import snapshot_dir
+
+        # The run read its datasets from a snapshot: point the data root at it again.
+        folder = snapshot_dir(settings, spec.source.name, spec.source.snapshot)
+        if not folder.is_dir() and need_data:
+            typer.secho(
+                f"Run '{run_id}' used snapshot {spec.source.snapshot} of source '{spec.source.name}', which is "
+                f"no longer in {folder.parent}. Take it again with `jellybean snapshot` (same window and sample).",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        settings, source = settings.with_data_root(folder), spec.source.model_dump()
+    return RunContext.open(settings, run_id, seed=spec.seed, filters=spec.filters, source=source), spec
+
+
+def _progress_line(started: float):
+    def progress(message: str) -> None:
+        elapsed = int(time.monotonic() - started)
+        typer.echo(f"[{elapsed // 60:02d}:{elapsed % 60:02d}] {message}")
+
+    return progress
+
+
+def _take_snapshot(settings, source: str, start: str | None, end: str | None, sample: float | None, refresh: bool):
+    """Copy (or reuse) the snapshot of a source, or exit with a clear error."""
+    from jellybean.sources.snapshot import SnapshotError, make_request, take_snapshot
+
+    try:
+        request = make_request(start, end, sample)
+        snapshot = take_snapshot(settings, source, request, refresh=refresh, progress=_progress_line(time.monotonic()))
+    except SnapshotError as exc:
+        typer.secho(f"Source error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    rows = sum(t.rows for t in snapshot.manifest.tables.values())
+    state = "reused" if snapshot.reused else "taken"
+    typer.echo(f"Snapshot {state}: {snapshot.manifest.describe()} -> {rows:,} rows in {snapshot.path}")
+    return snapshot
+
+
+_SOURCE_HELP = (
+    "Read the datasets from this source of config.yaml (copied to a local snapshot) instead of the data root."
+)
+_FROM_HELP = "Start of the window, e.g. 2026-10-01 (applies to the tables with a time_column)."
+_TO_HELP = "End of the window, excluded, e.g. 2026-11-01."
+_SAMPLE_HELP = "Share of the entities to copy, e.g. 0.1; every row of a sampled entity is kept."
+_REFRESH_HELP = "Copy again even if this snapshot already exists."
+
+
+@app.command("snapshot")
+def snapshot(
+    source: Annotated[str, typer.Argument(help="Source name, as in the `sources` section of config.yaml.")],
+    start: Annotated[str | None, typer.Option("--from", help=_FROM_HELP)] = None,
+    end: Annotated[str | None, typer.Option("--to", help=_TO_HELP)] = None,
+    sample: Annotated[float | None, typer.Option("--sample", help=_SAMPLE_HELP)] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help=_REFRESH_HELP)] = False,
+) -> None:
+    """Copy the tables of an external source to a local snapshot, without running anything.
+
+    The source filters by window, sample and columns; the result is a folder of
+    Parquet datasets that ``jellybean run --source`` (same options) reuses.
+    """
+    result = _take_snapshot(get_settings(), source, start, end, sample, refresh)
+    typer.echo(json.dumps(result.manifest.model_dump(), indent=2))
+
+
+@app.command("snapshots")
+def snapshots() -> None:
+    """List the local snapshots of external sources."""
+    from jellybean.sources.snapshot import list_snapshots
+
+    found = list_snapshots(get_settings().snapshots_root)
+    if not found:
+        typer.echo("No snapshots. Take one with: jellybean snapshot <source> --from ... --to ...")
+    for item in found:
+        m = item.manifest
+        size = sum(t.bytes for t in m.tables.values()) / 1e6
+        rows = sum(t.rows for t in m.tables.values())
+        typer.echo(f"{m.describe()}  |  {rows:,} rows, {size:,.1f} MB  |  {m.created_at}  |  {item.path}")
 
 
 @app.command("run")
@@ -303,12 +383,21 @@ def run(
             "Default: proposed by the profiler. One analysis per entity.",
         ),
     ] = None,
+    source: Annotated[str | None, typer.Option("--source", help=_SOURCE_HELP)] = None,
+    start: Annotated[str | None, typer.Option("--from", help=_FROM_HELP)] = None,
+    end: Annotated[str | None, typer.Option("--to", help=_TO_HELP)] = None,
+    sample: Annotated[float | None, typer.Option("--sample", help=_SAMPLE_HELP)] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help=_REFRESH_HELP)] = False,
     quiet: Annotated[bool, typer.Option("--quiet", help="Do not print progress.")] = False,
     verbose: Annotated[
         bool, typer.Option("--verbose", help="Also print every LLM turn and all tool arguments.")
     ] = False,
 ) -> None:
-    """Run the agent team on an instruction, from discovery to report.md."""
+    """Run the agent team on an instruction, from discovery to report.md.
+
+    The datasets come from the data root, or with ``--source`` from a local
+    snapshot of an external source (taken now, or reused when it exists).
+    """
     from jellybean.runtime.context import RunContext
     from jellybean.runtime.llm_client import LLMConfigurationError, build_chat_model
 
@@ -318,6 +407,15 @@ def run(
     except LLMConfigurationError as exc:
         typer.secho(f"LLM configuration error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
+    source_summary = None
+    if source is None and (start or end or sample is not None or refresh):
+        typer.secho("--from, --to, --sample and --refresh need --source.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    if source is not None:
+        from jellybean.sources.snapshot import manifest_summary
+
+        taken = _take_snapshot(settings, source, start, end, sample, refresh)
+        settings, source_summary = settings.with_data_root(taken.path), manifest_summary(taken.manifest)
     from jellybean.filters import FilterError, available_datasets, parse_filters, validate_filters
 
     try:
@@ -344,7 +442,11 @@ def run(
             f"events each (min {stats['min_events']:,}, max {stats['max_events']:,})"
         )
     ctx = RunContext.create(
-        settings, seed=seed if seed is not None else settings.config.run.default_seed, run_id=run_id, filters=parsed
+        settings,
+        seed=seed if seed is not None else settings.config.run.default_seed,
+        run_id=run_id,
+        filters=parsed,
+        source=source_summary,
     )
     runtime = _runtime(ctx, auto_approve, {"instruction": instruction, "labels": labels, "entity": user_entity})
     typer.echo(f"Run {ctx.run_id} ({settings.env.provider}:{runtime.llm.model_name}) -> {ctx.run_dir}")
@@ -367,7 +469,7 @@ def resume(
     """Continue a run from the phase recorded in its spec, reusing existing artifacts."""
     from jellybean.reporting import trace_stats
 
-    ctx, spec = _open_run(run_id)
+    ctx, spec = _open_run(run_id, need_data=True)
     runtime = _runtime(ctx, auto_approve, {"instruction": spec.instruction, "labels": spec.labels_dataset})
     # The token budget continues from what the run already used.
     stats = trace_stats(ctx)

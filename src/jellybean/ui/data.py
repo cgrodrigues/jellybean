@@ -77,6 +77,7 @@ def list_runs(workspace_root: Path) -> pd.DataFrame:
                     "instruction": spec.get("instruction", ""),
                     "primary": primary,
                     "entity": (spec.get("entity") or {}).get("column"),
+                    "source": source_label(spec.get("source")),
                     "phase": spec.get("phase"),
                     "status": result.get("status") or "not finished",
                     "findings": len(verdicts),
@@ -92,6 +93,7 @@ def list_runs(workspace_root: Path) -> pd.DataFrame:
             "instruction",
             "primary",
             "entity",
+            "source",
             "phase",
             "status",
             "findings",
@@ -100,6 +102,50 @@ def list_runs(workspace_root: Path) -> pd.DataFrame:
             "modified",
         ],
     )
+
+
+def source_label(source: dict[str, Any] | None) -> str:
+    """``local``, or the source of a run with its window and sample: ``ch_prod · 2026-10-01 to 2026-11-01 · 10%``."""
+    if not source:
+        return "local"
+    parts = [str(source.get("name"))]
+    if source.get("start") and source.get("end"):
+        parts.append(f"{source['start']} to {source['end']}")
+    if source.get("sample") is not None:
+        parts.append(f"{float(source['sample']) * 100:g}%")
+    return " · ".join(parts)
+
+
+def list_snapshots(snapshots_root: Path, workspace_root: Path) -> pd.DataFrame:
+    """One row per local snapshot of an external source, with the runs that read it."""
+    from jellybean.sources.snapshot import list_snapshots as find
+
+    used: dict[tuple[str, str], list[str]] = {}
+    if workspace_root.is_dir():
+        for folder in sorted(workspace_root.iterdir()):
+            source = _read_yaml(folder / "spec.yaml").get("source") if (folder / "spec.yaml").exists() else None
+            if source:
+                used.setdefault((str(source.get("name")), str(source.get("snapshot"))), []).append(folder.name)
+    rows = []
+    for item in find(snapshots_root):
+        m = item.manifest
+        rows.append(
+            {
+                "source": m.source,
+                "snapshot": m.id,
+                "from": m.start,
+                "to": m.end,
+                "sample": None if m.sample is None else f"{m.sample * 100:g}%",
+                "tables": ", ".join(f"{name} ({t.rows:,})" for name, t in m.tables.items()),
+                "rows": sum(t.rows for t in m.tables.values()),
+                "size_mb": round(sum(t.bytes for t in m.tables.values()) / 1e6, 1),
+                "created": m.created_at,
+                "runs": ", ".join(used.get((m.source, m.id), [])),
+                "path": str(item.path),
+            }
+        )
+    columns = ["source", "snapshot", "from", "to", "sample", "tables", "rows", "size_mb", "created", "runs", "path"]
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _finding_docs(run_dir: Path) -> list[dict[str, Any]]:
@@ -117,6 +163,8 @@ class Run:
     workspace_root: Path
     run_id: str
     data_root: Path | None = None
+    # Where the snapshots of external sources are kept (runs made with `--source` read from there).
+    snapshots_root: Path | None = None
     _spec: dict[str, Any] | None = field(default=None, repr=False)
 
     @property
@@ -125,6 +173,27 @@ class Run:
 
     def exists(self) -> bool:
         return (self.path / "spec.yaml").exists()
+
+    @property
+    def source(self) -> dict[str, Any] | None:
+        """The external source of the run's datasets (``spec.source``), or ``None`` for local data."""
+        return self.spec.get("source") or None
+
+    @property
+    def raw_root(self) -> Path | None:
+        """Folder of the datasets the run read: its snapshot, or the data root."""
+        source = self.source
+        if not source:
+            return self.data_root
+        if self.snapshots_root is None:
+            return None
+        return self.snapshots_root / str(source.get("name")) / str(source.get("snapshot"))
+
+    @property
+    def raw_missing(self) -> bool:
+        """The run read a snapshot that is no longer on disk (its raw data cannot be shown)."""
+        root = self.raw_root
+        return self.source is not None and (root is None or not root.is_dir())
 
     @property
     def spec(self) -> dict[str, Any]:
@@ -284,15 +353,16 @@ class Run:
 
     # ---------------------------------------------------------------- tables
     def tables(self) -> dict[str, Path]:
-        """Queryable tables: table artifacts of the run, then the datasets of the data root."""
+        """Queryable tables: table artifacts of the run, then the datasets it read (data root or snapshot)."""
         found: dict[str, Path] = {}
         artifacts = self.artifacts()
         for _, row in artifacts[artifacts["type"] == "table"].iterrows():
             path = self.path / row["path"]
             if path.exists():
                 found[row["id"]] = path
-        if self.data_root and self.data_root.is_dir():
-            for folder in sorted(self.data_root.iterdir()):
+        root = self.raw_root
+        if root and root.is_dir():
+            for folder in sorted(root.iterdir()):
                 usable = folder.is_dir() and _IDENT_RE.match(folder.name) and folder.name not in found
                 if usable and any(folder.rglob("*.parquet")):
                     found[folder.name] = folder

@@ -54,6 +54,10 @@ deep = [
 ui = [
     "streamlit>=1.50",
 ]
+# Optional ClickHouse source (`jellybean snapshot`, `jellybean run --source`).
+clickhouse = [
+    "clickhouse-connect>=0.8",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -191,6 +191,31 @@ class Decision(_Model):
     at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat(timespec="seconds"))
 
 
+class DataSource(_Model):
+    """The snapshot of an external source a run read its datasets from (``jellybean run --source``)."""
+
+    name: str
+    type: str = "clickhouse"
+    snapshot: str
+    start: str | None = None
+    end: str | None = None
+    # Share of the entities copied (None = all of them).
+    sample: float | None = None
+    created_at: str | None = None
+    # Rows copied per dataset, and the datasets the sample was applied to.
+    tables: dict[str, int] = Field(default_factory=dict)
+    sampled_tables: list[str] = Field(default_factory=list)
+
+    def label(self) -> str:
+        """``ch_prod, 2026-10-01 to 2026-11-01, 10% of entities``."""
+        parts = [self.name]
+        if self.start and self.end:
+            parts.append(f"{self.start} to {self.end}")
+        if self.sample is not None:
+            parts.append(f"{self.sample * 100:g}% of entities")
+        return ", ".join(parts)
+
+
 class AnalysisSpec(_Model):
     """Root of ``spec.yaml``."""
 
@@ -215,6 +240,8 @@ class AnalysisSpec(_Model):
     labels_dataset: str | None = None
     # Row filters per dataset, fixed at the start of the run (`jellybean run --filter`).
     filters: dict[str, str] = Field(default_factory=dict)
+    # External source of the datasets (None = the local data root).
+    source: DataSource | None = None
     context_notes: str = ""
     cleaning_plan: CleaningPlanRef = Field(default_factory=CleaningPlanRef)
     # Cleaned version of each dataset: {dataset: artifact_id}.
@@ -268,6 +295,10 @@ class AnalysisSpec(_Model):
             "report_language": self.report_language,
             "datasets": [{"name": d.name, "role": d.role} for d in self.datasets],  # paths: list_datasets
             "filters": self.filters,
+            # The data may be a window and a sample of the source, not all of it.
+            "source": self.source.model_dump(exclude={"created_at", "tables"}, exclude_none=True)
+            if self.source
+            else None,
             # Human context from the datasets' README.md files (column meanings, units...).
             "context_notes": self.context_notes[:700] + ("…" if len(self.context_notes) > 700 else ""),
             # Essential join fields only; the full test is in each join's evidence artifact.
@@ -327,7 +358,7 @@ def _merge(base: Any, patch: Any) -> Any:
 
 
 # Fields that only the runtime may change (agents cannot rewrite history).
-_PROTECTED = {"run_id", "seed", "instruction", "decisions", "labels_dataset", "filters"}
+_PROTECTED = {"run_id", "seed", "instruction", "decisions", "labels_dataset", "filters", "source"}
 
 
 def apply_patch(spec: AnalysisSpec, patch: dict[str, Any], allow_protected: bool = False) -> AnalysisSpec:
