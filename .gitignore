@@ -17,3 +17,6 @@ workspace/
 .internals/
 
 snapshots/
+
+.claude/
+.agents/

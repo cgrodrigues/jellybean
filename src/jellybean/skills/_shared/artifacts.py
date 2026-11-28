@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Immutable, versioned artifacts with lineage (spec section 6).
+"""Immutable, versioned artifacts with lineage.
 
 Every intermediate result produced by a tool (tables, JSON documents, plots) is
 stored under ``workspace/<run_id>/artifacts/`` and registered in

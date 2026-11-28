@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Findings: candidate anomalies/patterns and their lifecycle (spec section 6).
+"""Findings: candidate anomalies/patterns and their lifecycle.
 
 A finding is a JSON record in ``workspace/<run_id>/findings/<id>.json`` with a
 fixed schema. It is created by the detector, judged by the critic, described by
@@ -45,7 +45,7 @@ _LOCK = threading.Lock()
 
 
 class Finding(BaseModel):
-    """One finding. Field names follow spec section 6, plus bookkeeping fields."""
+    """One finding. The fields of a finding, plus bookkeeping fields."""
 
     model_config = ConfigDict(extra="forbid")
 

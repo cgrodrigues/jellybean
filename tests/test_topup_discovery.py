@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Discovery on the top-up ledger (requirements_2.md, phase 2 acceptance criteria).
+"""Discovery on the top-up ledger (acceptance criteria).
 
 Runs the profiler's deterministic tool chain (no LLM) on generated top-up data,
 taking each decision the way ``profiler/SKILL.md`` prescribes and only from tool

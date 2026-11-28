@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ruff: noqa: E501  (long SQL assertions read better on one line)
-"""Top-up ledger generator (requirements_2.md): sizes, invariants, anomalies and ground truth.
+"""Top-up ledger generator: sizes, invariants, anomalies and ground truth.
 
 Generated once with the default arguments (the counts of the document are exact
 for them); the checks query the written Parquet files with DuckDB, as an agent

@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic integrity checks of the profiler (``requirements_2.md`` section 10.2).
+"""Deterministic integrity checks of the profiler.
 
 Rules that can be verified without any model, computed inside DuckDB:
 

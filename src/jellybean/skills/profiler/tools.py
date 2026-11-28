@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Profiler tools (spec section 7.2).
+"""Profiler tools.
 
 The profiler understands the data before anyone touches it: it profiles each
 dataset, infers semantic types, grain, entity and time column, finds quality
@@ -1075,7 +1075,7 @@ def test_join(
         con.close()
 
     thresholds = _settings().config.join_confidence
-    # Coverage over rows with a non-null key (section 10.3): a sparse key is not "unmatched".
+    # Coverage over rows with a non-null key: a sparse key is not "unmatched".
     keyed_rows = left_rows - left_null
     coverage = matched_rows / keyed_rows if keyed_rows else 0.0
     null_key_share = left_null / left_rows if left_rows else 0.0

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ruff: noqa: E501  (SQL templates are kept on one line each, to read as SQL)
-"""Feature models for ledgers of typed events (``requirements_2.md`` section 10.4).
+"""Feature models for ledgers of typed events.
 
 Each tool extends the per-entity feature table (``features``) with one family of
 features, computed in DuckDB from the event table, and records every new

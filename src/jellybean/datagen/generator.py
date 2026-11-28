@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Synthetic telecom/e-commerce data with planted anomalies (spec section 9).
+"""Synthetic telecom/e-commerce data with planted anomalies.
 
 Produces Parquet datasets under ``out`` and the ground truth under ``truth``
 (which must be outside ``out`` so agents can never read it):
@@ -11,7 +11,7 @@ Produces Parquet datasets under ``out`` and the ground truth under ``truth``
 * ``cust_segmentation`` one row per customer (plus 15 duplicated keys);
 * ``orders``            one row per order;
 * ``topup``             prepaid wallet movements, with ``promotions``, ``dealers``
-                        and ``voucher_batches`` (``requirements_2.md``; see
+                        and ``voucher_batches`` (see
                         :mod:`jellybean.datagen.topup`).
 
 ``datasets`` selects the scenarios. Every scenario uses the same customers, so

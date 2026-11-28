@@ -48,7 +48,7 @@ class RunContext:
     # the summary stored in the spec. `settings.data_root` already points at it.
     source: dict | None = None
 
-    # Well-known locations inside the run workspace (section 6 of the spec).
+    # Well-known locations inside the run workspace.
     @property
     def artifacts_dir(self) -> Path:
         return self.run_dir / "artifacts"

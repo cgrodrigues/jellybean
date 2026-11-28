@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluation of a run against the dummy-data ground truth (spec section 10).
+"""Evaluation of a run against the dummy-data ground truth.
 
 ``scripts/evaluate_run.py <run_id>`` (or ``jellybean evaluate <run_id>``)
 compares a run with ``./ground_truth`` and reports: join and spec correctness,
@@ -251,7 +251,7 @@ def evaluate(ctx: RunContext, truth: Path) -> dict[str, Any]:
     # ---- hygiene
     out["hygiene"] = trace_stats(ctx)
 
-    # ---- acceptance criteria (section 10)
+    # ---- acceptance criteria
     applicable = {a: r for a, r in recall.items() if r is not None}
     out["acceptance"] = {
         # None = not applicable to this run (e.g. a run over orders only).

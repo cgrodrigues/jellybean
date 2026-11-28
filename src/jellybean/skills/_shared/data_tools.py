@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared data tools available to every agent that declares them (spec section 5).
+"""Shared data tools available to every agent that declares them.
 
 All tools return small summaries; raw rows (at most ``max_raw_rows``) are
 always placed under ``summary["rows"]`` so the decorator can enforce the cap.

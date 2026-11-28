@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end run with a real LLM: the whole flow, the report and the evaluation (spec section 10).
+"""End-to-end run with a real LLM: the whole flow, the report and the evaluation.
 
 Runs only with ``uv run pytest -m llm`` and a configured ``.env`` in the project
 root (JELLYBEAN_PROVIDER, JELLYBEAN_MODEL and credentials). It uses the session

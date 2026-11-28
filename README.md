@@ -1,5 +1,6 @@
 <h1><img src="docs/assets/jellybean.svg" alt="Jellybean logo" width="64" align="middle"> Jellybean</h1>
 
+[![Release](https://img.shields.io/github/v/release/cgrodrigues/jellybean)](https://github.com/cgrodrigues/jellybean/releases)
 [![CI](https://github.com/cgrodrigues/jellybean/actions/workflows/ci.yml/badge.svg)](https://github.com/cgrodrigues/jellybean/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
@@ -135,7 +136,7 @@ A dataset folder may contain a `README.md` with human context: what each
 column means, units (seconds vs milliseconds, currency), known particularities
 and what is normal for the business. For the dummy data, `generate-data
 --with-readme` writes one with column meanings only, never hints about the
-anomalies. That lets you compare runs with and without context (spec section 9).
+anomalies. That lets you compare runs with and without context.
 
 - The profiler reads the notes (`read_dataset_notes`) at the start of
   discovery and summarises them into `context_notes` in `spec.yaml`.
@@ -180,7 +181,7 @@ uv run jellybean resume <run_id>            # continues from the phase recorded 
 | `report <run_id> [--show]` | Regenerates `report.md` from the workspace (no LLM) |
 | `feedback <run_id> <finding> confirmed\|false_alarm [--note]` | Records human feedback; positive feedback registers the pattern (no LLM) |
 | `outputs <run_id> [--type table\|plot\|json] [--json]` | Lists the datasets and other artifacts of a run, grouped by agent, with their paths |
-| `evaluate <run_id>... [--json]` | Compares runs with the ground truth (telecom: spec section 10; top-up: `requirements_2.md` section 11), writes `evaluation.json` per run; several runs (one per entity) are also combined |
+| `evaluate <run_id>... [--json]` | Compares runs with the ground truth (telecom and top-up acceptance criteria), writes `evaluation.json` per run; several runs (one per entity) are also combined |
 
 ## External sources (ClickHouse)
 
@@ -452,7 +453,7 @@ matching files. The ground truth goes to
 `./ground_truth/`, which the agents can never read: `run_sql` refuses it and
 the DuckDB sandbox blocks it.
 
-### Prepaid top-ups (`requirements_2.md`)
+### Prepaid top-ups
 
 `topup` is a ledger of wallet movements: one row per movement, 16 movement
 types, about 543k rows over 90 days, partitioned by `date=`. It comes with three
@@ -497,7 +498,7 @@ uv run jellybean generate-data --datasets topup --with-readme   # only the ledge
 uv run jellybean generate-data --datasets topup --opaque-codes  # numeric codes, no hints in names
 ```
 
-Discovery on `topup` meets the criteria of `requirements_2.md` (checked by
+Discovery on `topup` meets its acceptance criteria (checked by
 `tests/test_topup_discovery.py`, with readable and opaque codes and no README):
 - the four enrichment joins (sparse keys) and the self-reference are found;
 - the balance invariant is found;
@@ -565,7 +566,7 @@ Known limitation: T7 (an advance, then silence) is found as a group, but most of
 its members have little activity, so the critic rules it `weak` (best recall in
 confirmed findings 0.3).
 
-## Top-up acceptance (`requirements_2.md` section 11)
+## Top-up acceptance
 
 A run analyses one entity, so the top-up scenario is evaluated over several runs:
 
@@ -599,7 +600,7 @@ five entities plus the run without promotions, and checks every criterion of
 section 11. The best recalls are T1 1.0, T2 0.8, T3 1.0, T4 1.0, T5 1.0, T6 1.0,
 T7 0.3 and T8 0.88: 7 of the 8 anomalies are at or above 0.6.
 
-## Acceptance (spec section 10)
+## Acceptance
 
 `jellybean evaluate <run_id>` prints:
 - join and spec correctness;

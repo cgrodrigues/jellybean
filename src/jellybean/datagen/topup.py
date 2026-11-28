@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepaid top-up ledger with planted anomalies (``requirements_2.md``).
+"""Prepaid top-up ledger with planted anomalies.
 
 One row per movement on a customer's wallet (``topup``, partitioned by
 ``date=YYYY-MM-DD``), plus three reference tables (``promotions``, ``dealers``,
@@ -9,11 +9,11 @@ One row per movement on a customer's wallet (``topup``, partitioned by
 generator (same ``msisdn`` with the ``+351`` prefix as ``traffic``), so the
 ledger joins ``cust_segmentation`` like ``traffic`` does.
 
-On top of a realistic background (section 5) the generator plants:
+On top of a realistic background the generator plants:
 
-* eight behavioural anomalies T1-T8 (section 6), each on its own entity;
-* five reconciliation problems R1-R5 and quality problems (section 7);
-* three traps for the critic TR1-TR3 (section 8).
+* eight behavioural anomalies T1-T8, each on its own entity;
+* five reconciliation problems R1-R5 and quality problems;
+* three traps for the critic TR1-TR3.
 
 Planted anomalies respect the balance invariant
 (``balance_after = balance_before + amount``) and referential integrity: only

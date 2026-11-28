@@ -626,8 +626,8 @@ def evaluate(
 ) -> None:
     """Compare runs with the dummy-data ground truth; writes evaluation.json per run.
 
-    Telecom runs use the criteria of spec section 10, top-up runs those of
-    requirements_2.md section 11. Several runs (one per entity) are also combined.
+    Telecom and top-up runs each have their own acceptance criteria. Several runs
+    (one per entity) are also combined.
     """
     from jellybean.evaluation import combine, format_combined, format_evaluation
     from jellybean.evaluation import evaluate as run_evaluation

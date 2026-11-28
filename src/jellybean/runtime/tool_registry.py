@@ -4,7 +4,7 @@
 """Tool contract: the ``ToolResult`` model and the ``@tool`` decorator.
 
 Every tool in every skill uses :func:`tool`. The decorator is the single place
-where the non-negotiable rules of the spec (section 5) are enforced, so no
+where the non-negotiable rules of the system are enforced, so no
 individual tool can forget them:
 
 * parameters are validated with pydantic before the function runs;
@@ -66,7 +66,7 @@ def current_tool() -> str | None:
 # Result model                                                                #
 # --------------------------------------------------------------------------- #
 class ToolResult(BaseModel):
-    """Uniform return value of every tool (spec section 5)."""
+    """Uniform return value of every tool."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -337,7 +337,7 @@ def enforce_limits(result: ToolResult, max_chars: int, max_rows: int) -> ToolRes
 
 
 # --------------------------------------------------------------------------- #
-# Decorator                                                                    #
+# Decorator                                                                   #
 # --------------------------------------------------------------------------- #
 class _ArgumentError(Exception):
     """Raised when call arguments do not match the tool signature."""
@@ -510,7 +510,7 @@ def tool(
                 call_args = dict(bound.arguments)
                 params = params_model.model_validate(call_args)
                 call_kwargs = {k: getattr(params, k) for k in params_model.model_fields}
-                # 2) Propagate the run seed to tools with randomness (section 5).
+                # 2) Propagate the run seed to tools with randomness.
                 if takes_seed and call_kwargs.get("seed") is None:
                     call_kwargs["seed"] = active_run.seed if active_run else settings.config.run.default_seed
                 # 3) Execute with a timeout, remembering the tool for lineage.

@@ -6,8 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-28
+
 ### Added
 
+- First version of the proof of concept: orchestrator, profiler, preparer,
+  feature engineer, detector, critic and analyst agents; deterministic tools
+  over DuckDB; data generators (telecom, top-up ledger, machine telemetry);
+  CLI (`jellybean run`, `resume`, `generate-data`, `datasets`); report and
+  evaluation against a ground truth.
 - Apache-2.0 license, `NOTICE`, `AUTHORS`, `CITATION.cff` and this changelog;
   SPDX license headers in the source, configuration and SVG files.
 - GitHub Actions CI: secret scan (gitleaks), lint (ruff), tests (pytest),
@@ -60,16 +67,6 @@ All notable changes to this project are recorded here. The format follows
 - Join-test artifacts (raw key values) are no longer readable through
   `read_json_artifact`.
 - A session test fixture left its run active for the following tests.
-
-## [0.1.0] - 2026-11-12
-
-### Added
-
-- First version of the proof of concept: orchestrator, profiler, preparer,
-  feature engineer, detector, critic and analyst agents; deterministic tools
-  over DuckDB; data generators (telecom, top-up ledger, machine telemetry);
-  CLI (`jellybean run`, `resume`, `generate-data`, `datasets`); report and
-  evaluation against a ground truth.
 
 [Unreleased]: https://github.com/cgrodrigues/jellybean/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/cgrodrigues/jellybean/releases/tag/v0.1.0

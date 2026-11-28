@@ -1,7 +1,7 @@
 # Copyright 2026 Carlos Rodrigues
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluate a run against the ground truth (spec section 10).
+"""Evaluate a run against the ground truth.
 
     uv run python scripts/evaluate_run.py <run_id> [--json]
 
