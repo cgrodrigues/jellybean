@@ -106,3 +106,22 @@ masking:
     - "^\\+?\\d{9,15}$"                      # phone-like numbers
     - "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"       # e-mail addresses
     - "^[A-Z]{2}\\d{2}[A-Z0-9]{10,30}$"      # IBAN-like strings
+
+# External sources: tables copied to a local snapshot before a run
+# (`jellybean snapshot <source>`, `jellybean run --source <source>`).
+# User and password come from the environment: JELLYBEAN_SOURCE_<NAME>_USER / _PASSWORD.
+# Every parameter of this file is described in docs/config-reference.md.
+# sources:
+#   ch_prod:
+#     type: clickhouse
+#     host: localhost
+#     port: 8123                   # null = default of the HTTP(S) interface
+#     secure: false
+#     database: telco
+#     tables:                      # key = dataset name seen by the run
+#       subscribers_events:
+#         time_column: event_ts    # --from/--to filter on this column
+#         entity_column: msisdn    # --sample keeps every row of the sampled entities
+#       subscribers:
+#         entity_column: msisdn
+#       tariff_plans: {}           # no options: copied whole

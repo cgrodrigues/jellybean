@@ -63,6 +63,34 @@ To change the grain by hand (the "Change something" answer at control 1), one
 | `phase` | `discovery`, `cleaning`, `features`, `detection`, `critique`, `analysis`, `report`, `done`. |
 | `decisions` | Human and automatic decisions with their evidence. Only the runtime writes them. |
 
+## Fields fixed when the run starts
+
+Set from the command line; agents cannot change them.
+
+| Field | Meaning |
+| --- | --- |
+| `instruction`, `seed`, `labels_dataset` | The instruction, `--seed` and `--labels`. |
+| `filters` | Row filters per dataset (`--filter`). |
+| `source` | Present when the datasets came from an external source (`--source`); absent for the data root. |
+
+### `source`
+
+```yaml
+source:
+  name: ch_prod                    # the source in config.yaml
+  type: clickhouse
+  snapshot: 20261001-20261101_s10_3f9a12c4   # folder under snapshots/ch_prod/
+  start: '2026-10-01'              # window on the tables with a time_column
+  end: '2026-11-01'                # excluded
+  sample: 0.1                      # share of the entities; null = all
+  created_at: '2026-11-28T10:06:52+00:00'
+  tables: {subscribers_events: 1832004, subscribers: 59112}   # rows copied
+  sampled_tables: [subscribers, subscribers_events]
+```
+
+Every agent sees the window and the sample in its summary of the spec, and the
+report states them: counts over a whole table describe the copy, not the source.
+
 ## Feature windows
 
 `build_entity_features` takes `windows`:

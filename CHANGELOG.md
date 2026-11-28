@@ -23,6 +23,11 @@ All notable changes to this project are recorded here. The format follows
 - `docs/performance-audit.md`: memory and CPU review of the whole pipeline.
 - `pytz`, so that DuckDB can return `TIMESTAMP WITH TIME ZONE` values.
 
+- External sources: `jellybean snapshot` and `jellybean run --source` copy
+  ClickHouse tables (time window, sample of whole entities, chosen columns) to a
+  local Parquet snapshot the run reads like the data root (`sources` in
+  `config.yaml`, optional extra `clickhouse`). The explorer has a Snapshots view.
+- `docs/config-reference.md`: every parameter of `config.yaml`.
 - Results explorer (`jellybean ui`, optional extra `ui`): a local, read-only web
   view of the runs, their report, findings, tables and steps.
 - A table with no unique key is a valid grain (`grain.unique: false`), shown as

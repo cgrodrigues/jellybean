@@ -81,7 +81,9 @@ cp .env.example .env         # then edit provider, model and key
 | `JELLYBEAN_DATA_ROOT` | Root folder of the input datasets | `./data` |
 | `JELLYBEAN_WORKSPACE_ROOT` | Run workspaces and pattern registry | `./workspace` |
 | `JELLYBEAN_GROUND_TRUTH_ROOT` | Ground truth of the dummy data (always blocked for agents) | `./ground_truth` |
+| `JELLYBEAN_SNAPSHOTS_ROOT` | Local copies of external sources | `./snapshots` |
 | `JELLYBEAN_CONFIG_FILE` | Path of the limits/thresholds file | `./config.yaml` |
+| `JELLYBEAN_SOURCE_<NAME>_USER`, `_PASSWORD` | Credentials of an external source | — |
 
 | Provider | LangChain class | Credentials |
 | --- | --- | --- |
@@ -93,8 +95,10 @@ cp .env.example .env         # then edit provider, model and key
 iterations, token budget, tool timeout, rework cycles, output caps, LLM call
 parameters (including prompt caching), join-confidence rules,
 pattern-registry thresholds, detection and critic thresholds, and PII masking
-patterns. Defaults live in [src/jellybean/settings.py](src/jellybean/settings.py),
-so the file is optional.
+patterns, and the external sources. Defaults live in
+[src/jellybean/settings.py](src/jellybean/settings.py), so the file is optional.
+**Every parameter, with its default and meaning, is in
+[docs/config-reference.md](docs/config-reference.md).**
 
 **Resources.** Three groups of settings keep a run within the machine:
 
@@ -178,6 +182,58 @@ uv run jellybean resume <run_id>            # continues from the phase recorded 
 | `outputs <run_id> [--type table\|plot\|json] [--json]` | Lists the datasets and other artifacts of a run, grouped by agent, with their paths |
 | `evaluate <run_id>... [--json]` | Compares runs with the ground truth (telecom: spec section 10; top-up: `requirements_2.md` section 11), writes `evaluation.json` per run; several runs (one per entity) are also combined |
 
+## External sources (ClickHouse)
+
+The datasets of a run can come from ClickHouse instead of the data root. The
+tables are first copied to a local **snapshot** (a folder of Parquet datasets);
+the run then works on that folder exactly as on `./data`. The agents and tools
+never connect to the database.
+
+```bash
+uv sync --extra clickhouse           # once: installs the ClickHouse client
+
+# copy and run in one step (the snapshot is reused if it already exists)
+uv run jellybean run "find unusual subscribers" \
+    --source ch_prod --from 2026-10-01 --to 2026-11-01 --sample 0.1
+
+# or copy first, run later with the same options
+uv run jellybean snapshot ch_prod --from 2026-10-01 --to 2026-11-01 --sample 0.1
+uv run jellybean snapshots           # what is on disk
+```
+
+The source and its tables are declared in `config.yaml` (`sources`, see
+[docs/config-reference.md](docs/config-reference.md#sources)); the user and
+password come from `JELLYBEAN_SOURCE_<NAME>_USER` / `_PASSWORD` in `.env`.
+
+| Option | Meaning |
+| --- | --- |
+| `--source NAME` | Read the datasets from this source. Without it: the data root. |
+| `--from`, `--to` | Window on the tables with a `time_column`; the end is excluded. Required when a table has one. A date or `2026-10-01T06:00`, in the time zone of the column. |
+| `--sample 0.1` | Copy 10% of the **entities** (chosen by a hash of `entity_column`) with **all** their rows, the same entities in every table and on every run. |
+| `--refresh` | Copy again even if this snapshot exists. |
+
+What to know:
+
+- **ClickHouse does the filtering.** Only the rows of the window, of the
+  sampled entities and of the configured columns leave it, already as Parquet
+  streamed to disk. A table with a `time_column` is copied one day per file,
+  and an interrupted copy continues where it stopped.
+- **A snapshot is identified by what defines its content**: the tables'
+  configuration, the window and the sample. The same request reuses it; a
+  change of any of them makes a new one. Snapshots live in
+  `./snapshots/<source>/<id>/` with a `snapshot.json` (queries, rows, date) and
+  can be deleted by hand when no longer needed.
+- **The run records its source** in `spec.yaml` (`source`) and in the report.
+  `resume` needs the snapshot to be still on disk; `report` and the explorer
+  do not.
+- **Timestamps** are stored as the wall-clock time of the column's time zone,
+  without a zone, so hours and days are those of the source on any machine.
+  UUIDs, IP addresses and enums are stored as text.
+- **A sample changes what counts mean.** Every row of a sampled entity is
+  there, so per-entity profiles are complete; but counts over the whole table,
+  rankings and the counterparts of an entity (who it calls) describe the copy,
+  not the source.
+
 ## Results explorer
 
 A local, read-only web view of the runs in the workspace, to navigate the
@@ -195,6 +251,11 @@ uv run jellybean ui     # http://localhost:8501 (--port, --no-open)
 | Findings | Filter by verdict and type. For a finding: the features that set it apart, its rules, the critic's checks, its plots, its members with their features next to the population medians, and the raw events of any member. |
 | Tables | Any table artifact or dataset: schema, filter (a SQL condition), sort and pages of 200 rows, plus a read-only SQL box over all the tables of the run. Rows can be downloaded as CSV. |
 | Steps | Every tool call with its duration, status and error; time per tool and tokens per agent. |
+| Snapshots | The local copies of external sources: window, sample, tables, rows, size and the runs that read each one. |
+
+A run made with `--source` shows its window and sample on every page and reads
+its raw tables from its snapshot. If the snapshot was deleted, the report,
+findings and artifacts still open and the pages say the source rows are gone.
 
 It never writes to a run, so it can stay open while a run is in progress
 ("Reload" re-reads the files). It listens on `localhost` only and shows the
@@ -625,6 +686,7 @@ The test found four hidden telecom assumptions, all now fixed generically:
 uv run pytest            # everything that does not need an LLM (about 3 min)
 uv run pytest -m llm     # end-to-end with the real LLM from .env (skipped if not configured)
 uv run pytest -m slow    # long acceptance runs: top-up detection per entity (about 13 min)
+uv run --with chdb pytest tests/test_sources_snapshot.py   # also runs the snapshot SQL on an embedded ClickHouse
 uv run ruff check . && uv run ruff format --check .
 ```
 
@@ -644,6 +706,7 @@ uv run ruff check . && uv run ruff format --check .
 | Top-up features (no LLM): flip_sign, expected responses, separation of T2/T6/T7/T8 | `test_topup_features.py` |
 | Top-up detection per entity (no LLM): T3/T4/T5 and T2/T6/T8 confirmed, TR1 explained | `test_topup_detection.py` |
 | Domain-agnostic detection helpers (activity, ties, context features) | `test_detection_core.py` |
+| External sources: snapshot queries, window, sample, reuse, resume, the run's source, explorer | `test_sources_snapshot.py` |
 | End to end with a real LLM (`-m llm`) | `test_e2e_llm.py` |
 
 ## Project layout
@@ -651,7 +714,7 @@ uv run ruff check . && uv run ruff format --check .
 ```
 .
 ├── pyproject.toml / uv.lock      # pinned dependencies
-├── config.yaml                   # limits and thresholds
+├── config.yaml                   # limits, thresholds and external sources (docs/config-reference.md)
 ├── .env.example                  # provider, model, key, paths
 ├── scripts/
 │   ├── generate_dummy_data.py
@@ -662,6 +725,7 @@ uv run ruff check . && uv run ruff format --check .
 │   ├── settings.py               # .env + config.yaml
 │   ├── spec.py                   # spec.yaml schema, patching, join-confidence rules
 │   ├── reporting.py              # report.md
+│   ├── sources/                  # external sources: snapshot.py (copy to local Parquet), clickhouse.py (client)
 │   ├── ui/                       # results explorer (`jellybean ui`): data.py (read-only access), app.py (Streamlit)
 │   ├── evaluation.py             # comparison with the ground truth
 │   ├── runtime/

@@ -44,6 +44,9 @@ class RunContext:
     # Row filters per dataset ({"traffic": "date >= '2026-10-01'"}), applied to every
     # dataset view of the run (set with `jellybean run --filter`).
     filters: dict[str, str] = field(default_factory=dict)
+    # Snapshot of an external source the datasets come from (`jellybean run --source`):
+    # the summary stored in the spec. `settings.data_root` already points at it.
+    source: dict | None = None
 
     # Well-known locations inside the run workspace (section 6 of the spec).
     @property
@@ -89,7 +92,12 @@ class RunContext:
 
     @classmethod
     def create(
-        cls, settings: Settings, seed: int, run_id: str | None = None, filters: dict[str, str] | None = None
+        cls,
+        settings: Settings,
+        seed: int,
+        run_id: str | None = None,
+        filters: dict[str, str] | None = None,
+        source: dict | None = None,
     ) -> RunContext:
         """Create the workspace folders of a new run and return its context."""
         root = settings.workspace_root
@@ -100,15 +108,26 @@ class RunContext:
         run_dir = root / run_id
         for sub in ("artifacts", "findings", "logs"):
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
-        return cls(run_id=run_id, run_dir=run_dir, seed=seed, settings=settings, filters=dict(filters or {}))
+        return cls(
+            run_id=run_id, run_dir=run_dir, seed=seed, settings=settings, filters=dict(filters or {}), source=source
+        )
 
     @classmethod
-    def open(cls, settings: Settings, run_id: str, seed: int, filters: dict[str, str] | None = None) -> RunContext:
+    def open(
+        cls,
+        settings: Settings,
+        run_id: str,
+        seed: int,
+        filters: dict[str, str] | None = None,
+        source: dict | None = None,
+    ) -> RunContext:
         """Re-open an existing run workspace (used by ``resume``)."""
         run_dir = settings.workspace_root / run_id
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Run workspace not found: {run_dir}")
-        return cls(run_id=run_id, run_dir=run_dir, seed=seed, settings=settings, filters=dict(filters or {}))
+        return cls(
+            run_id=run_id, run_dir=run_dir, seed=seed, settings=settings, filters=dict(filters or {}), source=source
+        )
 
 
 def next_run_id(workspace_root: Path, today: date | None = None) -> str:

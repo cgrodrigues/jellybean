@@ -78,6 +78,10 @@ _TEXT = {
         "rows": "rows",
         "issues": "Open issues reported by the agents",
         "filters": "Row filters",
+        "source": "Source",
+        "source_window": "rows from {start} to {end} (end excluded)",
+        "source_sample": "a {share}% sample of the entities of {tables} (all their rows)",
+        "source_note": "Counts and rankings describe this copy, not the whole source.",
         "overview": "Findings on the PCA map",
         "notes": "Context notes (from the datasets' README.md)",
         "clusters": "Cluster map",
@@ -136,6 +140,10 @@ _TEXT = {
         "rows": "linhas",
         "issues": "Problemas em aberto reportados pelos agentes",
         "filters": "Filtros de linhas",
+        "source": "Origem",
+        "source_window": "linhas de {start} a {end} (fim excluído)",
+        "source_sample": "uma amostra de {share}% das entidades de {tables} (todas as suas linhas)",
+        "source_note": "As contagens e os rankings descrevem esta cópia, não a origem inteira.",
         "overview": "Achados no mapa PCA",
         "notes": "Notas de contexto (do README.md dos datasets)",
         "clusters": "Mapa de clusters",
@@ -250,6 +258,16 @@ def build_report(ctx: RunContext, run_result: dict[str, Any] | None = None) -> s
     if spec.context_notes:
         add(f"\n**{t['notes']}:**\n")
         add("> " + spec.context_notes.strip().replace("\n", "\n> ") + "\n")
+    if spec.source:
+        src = spec.source
+        parts = [f"`{src.name}` ({src.type}, snapshot `{src.snapshot}`)"]
+        if src.start and src.end:
+            parts.append(t["source_window"].format(start=src.start, end=src.end))
+        if src.sample is not None:
+            tables = ", ".join(f"`{name}`" for name in src.sampled_tables)
+            parts.append(t["source_sample"].format(share=f"{src.sample * 100:g}", tables=tables))
+        note = f" {t['source_note']}" if len(parts) > 1 else ""
+        add(f"\n**{t['source']}:** " + "; ".join(parts) + "." + note)
     if spec.filters:
         add(f"\n**{t['filters']}:** " + "; ".join(f"`{name}`: {cond}" for name, cond in spec.filters.items()))
     if spec.joins:

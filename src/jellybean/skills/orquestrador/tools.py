@@ -34,7 +34,7 @@ from jellybean.skills._shared.spec_tools import (  # noqa: F401 - update_spec is
     read_spec,
     update_spec,
 )
-from jellybean.spec import AnalysisSpec, Decision, EntitySpec, record_decision, save_spec
+from jellybean.spec import AnalysisSpec, DataSource, Decision, EntitySpec, record_decision, save_spec
 
 # Generous timeouts: delegation runs a whole agent, ask_human waits for a person.
 _LONG_TIMEOUT_S = 24 * 3600
@@ -71,6 +71,7 @@ def init_run(instruction: str, report_language: str = "en") -> ToolResult:
         report_language=report_language,
         labels_dataset=runtime.options.get("labels"),
         filters=dict(ctx.filters),
+        source=DataSource(**ctx.source) if ctx.source else None,
     )
     user_entity = runtime.options.get("entity")  # {"dataset", "column", "stats"} from --entity
     if user_entity:

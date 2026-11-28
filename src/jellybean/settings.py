@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Supported LLM providers. The runtime (phase 3) maps each to an LLMClient.
@@ -49,6 +49,8 @@ class EnvSettings(BaseSettings):
     data_root: Path = Path("./data")
     workspace_root: Path = Path("./workspace")
     ground_truth_root: Path = Path("./ground_truth")
+    # Local copies of external sources (`jellybean snapshot`), one folder per snapshot.
+    snapshots_root: Path = Path("./snapshots")
     config_file: Path = Path("./config.yaml")
 
 
@@ -217,6 +219,41 @@ class MaskingConfig(_Section):
     )
 
 
+_NAME_RE = r"^[A-Za-z_][A-Za-z0-9_]*$"
+_Name = Annotated[str, StringConstraints(pattern=_NAME_RE)]
+
+
+class SourceTableConfig(_Section):
+    """One table of an external source; it becomes a dataset named after its key."""
+
+    # Table name in the source when it differs from the dataset name.
+    table: _Name | None = None
+    # Column filtered by the snapshot window (`--from`/`--to`); without it the table is copied whole.
+    time_column: _Name | None = None
+    # Column identifying the entity; `--sample` keeps every row of the sampled entities.
+    entity_column: _Name | None = None
+    # Columns to copy (default: all).
+    columns: list[_Name] | None = Field(None, min_length=1)
+    # Fixed row filter, in the SQL of the source.
+    where: str | None = None
+
+
+class SourceConfig(_Section):
+    """An external database whose tables are copied to local Parquet before a run.
+
+    The user and password are never written here: they come from the environment
+    (``JELLYBEAN_SOURCE_<NAME>_USER`` and ``JELLYBEAN_SOURCE_<NAME>_PASSWORD``).
+    ``_HOST``, ``_PORT``, ``_SECURE`` and ``_DATABASE`` override the values below.
+    """
+
+    type: Literal["clickhouse"] = "clickhouse"
+    host: str = "localhost"
+    port: int | None = Field(None, ge=1, le=65535)  # null = default of the HTTP(S) interface
+    secure: bool = False
+    database: _Name = "default"
+    tables: dict[_Name, SourceTableConfig] = Field(min_length=1)
+
+
 class AppConfig(_Section):
     """Root of ``config.yaml``."""
 
@@ -231,6 +268,7 @@ class AppConfig(_Section):
     detection: DetectionConfig = Field(default_factory=DetectionConfig)
     critic: CriticConfig = Field(default_factory=CriticConfig)
     masking: MaskingConfig = Field(default_factory=MaskingConfig)
+    sources: dict[_Name, SourceConfig] = Field(default_factory=dict)
 
 
 def load_config(path: Path) -> AppConfig:
@@ -260,6 +298,14 @@ class Settings(BaseModel):
     @property
     def ground_truth_root(self) -> Path:
         return self.env.ground_truth_root.resolve()
+
+    @property
+    def snapshots_root(self) -> Path:
+        return self.env.snapshots_root.resolve()
+
+    def with_data_root(self, path: Path) -> Settings:
+        """The same settings reading the datasets from another folder (a snapshot)."""
+        return self.model_copy(update={"env": self.env.model_copy(update={"data_root": Path(path)})})
 
     @classmethod
     def build(cls, env: EnvSettings | None = None, config: AppConfig | None = None) -> Settings:

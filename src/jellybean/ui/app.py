@@ -24,7 +24,7 @@ from jellybean.ui import data
 from jellybean.ui.data import ExplorerError, Run
 
 LOGO = Path(__file__).resolve().parents[3] / "docs" / "assets" / "jellybean.svg"
-VIEWS = ["Runs", "Overview", "Findings", "Tables", "Steps"]
+VIEWS = ["Runs", "Overview", "Findings", "Tables", "Steps", "Snapshots"]
 _IMAGE_LINE = re.compile(r"^!\[(.*?)\]\((.+?)\)\s*$")
 
 
@@ -410,6 +410,50 @@ def view_steps(run: Run) -> None:
     )
 
 
+def view_snapshots(snapshots: pd.DataFrame) -> None:
+    st.header("Snapshots")
+    st.caption(
+        "Local copies of external sources, taken with `jellybean snapshot` or `jellybean run --source`. "
+        "A snapshot no run uses can be deleted from disk; the runs that used one keep their findings and report."
+    )
+    if snapshots.empty:
+        st.info("No snapshot yet. Take one with `jellybean snapshot <source> --from ... --to ...`.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Snapshots", len(snapshots))
+    c2.metric("Rows", f"{int(snapshots['rows'].sum()):,}")
+    c3.metric("Size on disk", f"{snapshots['size_mb'].sum():,.1f} MB")
+    st.dataframe(
+        snapshots,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "tables": st.column_config.TextColumn(width="large"),
+            "size_mb": st.column_config.NumberColumn("size (MB)", format="%.1f"),
+        },
+    )
+
+
+def _source_notice(run: Run) -> None:
+    """Say, on every page of a run made from a source, that its data is a copy with a window and a sample."""
+    source = run.source
+    if not source:
+        return
+    limits = []
+    if source.get("start") and source.get("end"):
+        limits.append(f"rows from {source['start']} to {source['end']} (end excluded)")
+    if source.get("sample") is not None:
+        tables = ", ".join(source.get("sampled_tables") or [])
+        limits.append(f"{float(source['sample']) * 100:g}% of the entities of {tables}")
+    text = f"Data from source `{source.get('name')}` (snapshot `{source.get('snapshot')}`)"
+    st.caption(text + (": " + "; ".join(limits) + ". Rows outside it are not here." if limits else "."))
+    if run.raw_missing:
+        st.warning(
+            "The snapshot this run read is no longer on disk: the report, findings and artifacts are shown, "
+            "but the source tables and the events of a member are not available."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Page                                                                        #
 # --------------------------------------------------------------------------- #
@@ -437,11 +481,20 @@ def main() -> None:
             st.rerun()
 
     view = st.session_state.get("view", "Runs")
+    if view == "Snapshots":
+        view_snapshots(data.list_snapshots(settings.snapshots_root, settings.workspace_root))
+        return
     if view == "Runs" or not ids:
         view_runs(runs)
         return
-    run = Run(settings.workspace_root, st.session_state["run"], data_root=settings.data_root)
+    run = Run(
+        settings.workspace_root,
+        st.session_state["run"],
+        data_root=settings.data_root,
+        snapshots_root=settings.snapshots_root,
+    )
     masker = data.make_masker(settings, run.run_id) if mask else None
+    _source_notice(run)
     try:
         if view == "Overview":
             view_overview(run)
