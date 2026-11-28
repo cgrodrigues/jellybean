@@ -50,6 +50,10 @@ explain = [
 deep = [
     "torch>=2.5",
 ]
+# Optional results explorer (`jellybean ui`): a local, read-only web view of the runs.
+ui = [
+    "streamlit>=1.50",
+]
 
 [build-system]
 requires = ["hatchling"]

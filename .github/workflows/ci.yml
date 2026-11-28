@@ -54,7 +54,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - run: uv sync --frozen
+      # With the `ui` extra, so that the pages of the results explorer are tested too.
+      - run: uv sync --frozen --extra ui
       # The default selection: no LLM calls, no long acceptance runs (see pyproject.toml).
       - run: uv run pytest
 
